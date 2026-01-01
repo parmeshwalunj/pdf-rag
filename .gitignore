@@ -68,4 +68,5 @@ ENV/
 # Server specific (adjust based on your server stack)
 *.log
 .cache/
+server/uploads/
 
