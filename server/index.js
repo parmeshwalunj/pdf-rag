@@ -9,7 +9,6 @@ import { QdrantVectorStore } from "@langchain/qdrant";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { OpenAI } from "openai";
 
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 // Load .env file from the server directory
@@ -32,11 +31,28 @@ const storage = multer.diskStorage({
   },
   filename: function (req, file, cb) {
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, `${uniqueSuffix}-${file.originalname}`);
+    // Sanitize filename to prevent path traversal attacks
+    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, "_");
+    cb(null, `${uniqueSuffix}-${sanitizedName}`);
   },
 });
 
-const upload = multer({ storage: storage });
+// File validation: only allow PDFs, max 10MB
+const fileFilter = (req, file, cb) => {
+  if (file.mimetype === "application/pdf") {
+    cb(null, true);
+  } else {
+    cb(new Error("Only PDF files are allowed"), false);
+  }
+};
+
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+  },
+});
 
 const app = express();
 app.use(cors());
@@ -46,37 +62,77 @@ app.get("/", (req, res) => {
 });
 
 app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
-  // Enqueuing all the files to the queue for processing
-  await queue.add("file-ready", {
-    filename: req.file.originalname,
-    destination: req.file.destination,
-    path: req.file.path,
-  });
-  return res.json({ message: "File uploaded successfully!" });
+  try {
+    // Validate file was uploaded
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    // Enqueuing all the files to the queue for processing
+    // Fixed: Changed "file-ready" to "file-upload-queue" to match worker queue name
+    await queue.add("file-upload-queue", {
+      filename: req.file.originalname,
+      destination: req.file.destination,
+      path: req.file.path,
+    });
+    return res.json({ message: "File uploaded successfully!" });
+  } catch (error) {
+    console.error("Error uploading file:", error);
+    // Handle multer errors (file size, type, etc.)
+    if (error instanceof multer.MulterError) {
+      if (error.code === "LIMIT_FILE_SIZE") {
+        return res
+          .status(400)
+          .json({ error: "File too large. Maximum size is 10MB" });
+      }
+      return res.status(400).json({ error: error.message });
+    }
+    return res.status(500).json({ error: "Failed to upload file" });
+  }
 });
 
 app.get("/chat", async (req, res) => {
-  const userQuery = req.query.message;
+  try {
+    const userQuery = req.query.message;
 
-  const embeddings = new OpenAIEmbeddings({
-    model: "text-embedding-3-small",
-    apiKey: process.env.OPENAI_API_KEY,
-  });
-
-  const vectorStore = await QdrantVectorStore.fromExistingCollection(
-    embeddings,
-    {
-      url: process.env.QDRANT_URL,
-      collectionName: "pdf-docs",
+    // Validate query parameter
+    if (
+      !userQuery ||
+      typeof userQuery !== "string" ||
+      userQuery.trim().length === 0
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Message query parameter is required" });
     }
-  );
 
-  const ret = vectorStore.asRetriever({
-    k: 2,
-  });
-  const result = await ret.invoke(userQuery);
+    // Validate environment variables
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OpenAI API key not configured" });
+    }
+    if (!process.env.QDRANT_URL) {
+      return res.status(500).json({ error: "Qdrant URL not configured" });
+    }
 
-  const SYSTEM_PROMPT = `
+    const embeddings = new OpenAIEmbeddings({
+      model: "text-embedding-3-small",
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
+    const vectorStore = await QdrantVectorStore.fromExistingCollection(
+      embeddings,
+      {
+        url: process.env.QDRANT_URL,
+        collectionName: "pdf-docs",
+      }
+    );
+
+    const ret = vectorStore.asRetriever({
+      k: 2,
+    });
+    const result = await ret.invoke(userQuery);
+
+    const SYSTEM_PROMPT = `
 You are a helpful assistant that can answer questions about the documents.
 You are given a question and a list of documents.
 You need to answer the question based on the documents.
@@ -84,18 +140,50 @@ If the question is not related to the documents, you should say "This question i
 Be concise and to the point.
 Context: ${JSON.stringify(result)}
 `;
-  const chatResult = await client.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userQuery },
-    ],
-  });
+    const chatResult = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userQuery },
+      ],
+    });
 
-  return res.json({
-    result: chatResult.choices[0].message.content,
-    docs: result,
-  });
+    return res.json({
+      result: chatResult.choices[0].message.content,
+      docs: result,
+    });
+  } catch (error) {
+    console.error("Error in chat endpoint:", error);
+    // Provide user-friendly error messages
+    if (
+      error.message?.includes("ECONNREFUSED") ||
+      error.message?.includes("connect")
+    ) {
+      return res
+        .status(503)
+        .json({
+          error: "Vector database is unavailable. Please try again later.",
+        });
+    }
+    return res.status(500).json({ error: "Failed to process chat request" });
+  }
+});
+
+// Global error handler middleware (must be last)
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res
+        .status(400)
+        .json({ error: "File too large. Maximum size is 10MB" });
+    }
+    return res.status(400).json({ error: error.message });
+  }
+  if (error) {
+    console.error("Unhandled error:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+  next();
 });
 
 app.listen(8000, () => console.log(`Server started on port: ${8000}`));
