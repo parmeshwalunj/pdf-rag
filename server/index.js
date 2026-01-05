@@ -25,6 +25,44 @@ const queue = new Queue("file-upload-queue", {
   },
 });
 
+// Cache vector store connections to avoid recreating on each request
+// This significantly improves performance
+let cachedEmbeddings = null;
+let cachedVectorStore = null;
+
+const getVectorStore = async () => {
+  // Return cached instance if available
+  if (cachedVectorStore && cachedEmbeddings) {
+    return cachedVectorStore;
+  }
+
+  // Validate environment variables
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OpenAI API key not configured");
+  }
+  if (!process.env.QDRANT_URL) {
+    throw new Error("Qdrant URL not configured");
+  }
+
+  // Create new embeddings instance (lightweight, can be reused)
+  cachedEmbeddings = new OpenAIEmbeddings({
+    model: "text-embedding-3-small",
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+
+  // Create and cache vector store connection
+  cachedVectorStore = await QdrantVectorStore.fromExistingCollection(
+    cachedEmbeddings,
+    {
+      url: process.env.QDRANT_URL,
+      collectionName: "pdf-docs",
+    }
+  );
+
+  console.log("Vector store connection cached");
+  return cachedVectorStore;
+};
+
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     cb(null, "uploads/");
@@ -106,26 +144,8 @@ app.get("/chat", async (req, res) => {
         .json({ error: "Message query parameter is required" });
     }
 
-    // Validate environment variables
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OpenAI API key not configured" });
-    }
-    if (!process.env.QDRANT_URL) {
-      return res.status(500).json({ error: "Qdrant URL not configured" });
-    }
-
-    const embeddings = new OpenAIEmbeddings({
-      model: "text-embedding-3-small",
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-
-    const vectorStore = await QdrantVectorStore.fromExistingCollection(
-      embeddings,
-      {
-        url: process.env.QDRANT_URL,
-        collectionName: "pdf-docs",
-      }
-    );
+    // Get cached vector store (or create if first request)
+    const vectorStore = await getVectorStore();
 
     const ret = vectorStore.asRetriever({
       k: 2,

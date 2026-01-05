@@ -2,6 +2,7 @@
 
 import { useState } from "react"
 import { Upload } from "lucide-react"
+import { api } from "@/lib/api"
 
 export default function FileUpload() {
   const [file, setFile] = useState<File | null>(null);
@@ -36,20 +37,7 @@ export default function FileUpload() {
               setUploading(true);
 
               try {
-                const formData = new FormData();
-                formData.append('pdf', selectedFile);
-
-                const response = await fetch("http://localhost:8000/upload/pdf", {
-                  method: 'POST',
-                  body: formData,
-                });
-
-                if (!response.ok) {
-                  const errorData = await response.json().catch(() => ({ error: "Unknown error" }));
-                  throw new Error(errorData.error || `Upload failed: ${response.status}`);
-                }
-
-                const data = await response.json();
+                const data = await api.uploadPDF(selectedFile);
                 console.log("File uploaded successfully:", data);
                 setSuccess(true);
                 setFile(null); // Reset file after successful upload
@@ -73,7 +61,7 @@ export default function FileUpload() {
   return (
     <div className="bg-slate-900 text-white shadow-2xl flex justify-center items-center p-4 rounded-lg border-white border-2 min-h-[200px]">
       <div className="flex flex-col items-center justify-center gap-4 w-full">
-        <div 
+      <div 
           onClick={!uploading ? handleUploadButtonClick : undefined}
           className={`flex items-center justify-center flex-col cursor-pointer transition-opacity ${
             uploading ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-80'

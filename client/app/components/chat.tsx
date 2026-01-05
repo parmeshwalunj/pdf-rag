@@ -2,7 +2,9 @@
 
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { useState } from "react"
+import { useState, useRef, useEffect } from "react"
+import { api } from "@/lib/api"
+import { Send, Loader2 } from "lucide-react"
 
 interface Doc{
     pageContent?: string;
@@ -21,11 +23,16 @@ interface IMessage {
 }
 
 export default function ChatComponent() {
-
   const [message, setMessage] = useState<string>("");
   const [messages, setMessages] = useState<IMessage[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   const handleSend = async () => {
     if (!message.trim() || loading) return;
@@ -39,15 +46,7 @@ export default function ChatComponent() {
     setMessages(prev => [...prev, {role: "user", content: userMessage}]);
 
     try {
-      const response = await fetch(`http://localhost:8000/chat?message=${encodeURIComponent(userMessage)}`);
-      
-      // Check if response is ok
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: "Unknown error" }));
-        throw new Error(errorData.error || `Server error: ${response.status}`);
-      }
-
-      const data = await response.json();
+      const data = await api.chat(userMessage);
       
       // Validate response data
       if (!data || !data.result) {
@@ -75,49 +74,108 @@ export default function ChatComponent() {
   }
 
   return (
-    <div className="p-4 flex flex-col h-full">
-        <div className="flex-1 overflow-y-auto mb-20">
-            {messages.length === 0 && (
-              <div className="text-center text-gray-500 mt-8">
-                Start a conversation by asking a question about your PDF documents.
-              </div>
-            )}
-            {messages.map((msg, index) => (
-              <pre key={index} className="mb-2 p-2 bg-gray-100 rounded">
-                {JSON.stringify(msg, null, 2)}
-              </pre>
-            ))}
-            {error && (
-              <div className="text-red-500 text-sm mt-2 p-2 bg-red-50 rounded">
-                {error}
-              </div>
-            )}
-        </div>
-        <div className="fixed bottom-4 left-[30vw] right-4 flex gap-3">
-            <Input 
-              value={message} 
-              onChange={(e) => setMessage(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
-              placeholder="Type your message here..." 
-              disabled={loading}
-            />
-            <Button 
-              onClick={handleSend} 
-              disabled={!message.trim() || loading}
+    <div className="flex flex-col h-full bg-gray-50 overflow-hidden">
+      {/* Messages area */}
+      <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-4">
+        {messages.length === 0 && (
+          <div className="text-center text-gray-500 mt-8">
+            <p className="text-lg mb-2">👋 Welcome!</p>
+            <p>Start a conversation by asking a question about your PDF documents.</p>
+          </div>
+        )}
+        
+        {messages.map((msg, index) => (
+          <div
+            key={index}
+            className={`flex ${
+              msg.role === "user" ? "justify-end" : "justify-start"
+            }`}
+          >
+            <div
+              className={`max-w-[80%] rounded-lg p-3 ${
+                msg.role === "user"
+                  ? "bg-blue-500 text-white"
+                  : "bg-white text-gray-800 shadow-sm border border-gray-200"
+              }`}
             >
-              {loading ? "Sending..." : "Send"}
-            </Button>
-        </div>
-    </div>
+              <div className="whitespace-pre-wrap wrap-break-word overflow-wrap-anywhere">
+                {msg.content}
+              </div>
+              
+              {/* Show source documents if available */}
+              {msg.documents && msg.documents.length > 0 && (
+                <div className="mt-2 pt-2 border-t border-gray-300 text-xs opacity-75">
+                  <p className="font-semibold mb-1">Sources:</p>
+                  {msg.documents.map((doc, docIndex) => (
+                    <div key={docIndex} className="mb-1">
+                      {doc.metadata?.source && (
+                        <span className="italic">
+                          {doc.metadata.source.split('/').pop()}
+                        </span>
+                      )}
+                      {doc.metadata?.loc?.pageNumber && (
+                        <span className="ml-2">(Page {doc.metadata.loc.pageNumber})</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        
+        {/* Loading indicator */}
+        {loading && (
+          <div className="flex justify-start">
+            <div className="bg-white rounded-lg p-3 shadow-sm border border-gray-200">
+              <div className="flex items-center gap-2 text-gray-500">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                <span className="text-sm">Thinking...</span>
+              </div>
+            </div>
+          </div>
+        )}
+        
+        {/* Error message */}
+        {error && !loading && (
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
+            {error}
+          </div>
+        )}
+        
+        {/* Scroll anchor */}
+        <div ref={messagesEndRef} />
+      </div>
 
-    // <div className="flex flex-col h-full">
-    //   <div className="flex-1 overflow-y-auto">
-    //     {messages.map((message, index) => (
-    //       <div key={index} className={`${message.role === "user" ? "self-end" : "self-start"}`}>
-    //         {message.content}
-    //       </div>
-    //     ))}
-    //   </div>
-    // </div>
+      {/* Input area */}
+      <div className="border-t border-gray-200 bg-white p-4 shrink-0">
+        <div className="flex gap-2">
+          <Input
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
+            placeholder="Type your message here..."
+            disabled={loading}
+            className="flex-1"
+          />
+          <Button
+            onClick={handleSend}
+            disabled={!message.trim() || loading}
+            className="px-6"
+          >
+            {loading ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Send className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+      </div>
+    </div>
   )
 }
