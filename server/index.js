@@ -8,20 +8,52 @@ import { Queue } from "bullmq";
 import { QdrantVectorStore } from "@langchain/qdrant";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { OpenAI } from "openai";
+import { uploadPDFToCloudinary } from "./services/cloudinary.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 // Load .env file from the server directory
 dotenv.config({ path: join(__dirname, ".env") });
 
+// ============================================
+// Environment Variable Validation
+// ============================================
+const requiredEnvVars = [
+  'OPENAI_API_KEY',
+  'QDRANT_URL',
+  'CLOUDINARY_CLOUD_NAME',
+  'CLOUDINARY_API_KEY',
+  'CLOUDINARY_API_SECRET',
+];
+
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  console.error('❌ Missing required environment variables:');
+  missingVars.forEach(varName => {
+    console.error(`   - ${varName}`);
+  });
+  console.error('\nPlease set these in your .env file or environment.');
+  console.error('See .env.example for reference.\n');
+  process.exit(1);
+}
+
+console.log('✅ All required environment variables are set');
+
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// Redis/Valkey connection configuration
+// Use environment variables for production (e.g., Upstash Redis)
+// Falls back to localhost for local development
 const queue = new Queue("file-upload-queue", {
   connection: {
-    host: "localhost",
-    port: 6379,
+    host: process.env.REDIS_HOST || "localhost",
+    port: parseInt(process.env.REDIS_PORT || "6379", 10),
+    // For production Redis services (Upstash, Redis Cloud, etc.), you may need:
+    // password: process.env.REDIS_PASSWORD,
+    // tls: process.env.REDIS_TLS === "true" ? {} : undefined,
   },
 });
 
@@ -63,18 +95,6 @@ const getVectorStore = async () => {
   return cachedVectorStore;
 };
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, "uploads/");
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    // Sanitize filename to prevent path traversal attacks
-    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, "_");
-    cb(null, `${uniqueSuffix}-${sanitizedName}`);
-  },
-});
-
 // File validation: only allow PDFs, max 10MB
 const fileFilter = (req, file, cb) => {
   if (file.mimetype === "application/pdf") {
@@ -84,8 +104,9 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
+// Use memory storage - we'll upload to Cloudinary instead of disk
 const upload = multer({
-  storage: storage,
+  storage: multer.memoryStorage(), // Store in memory, then upload to Cloudinary
   fileFilter: fileFilter,
   limits: {
     fileSize: 10 * 1024 * 1024, // 10MB limit
@@ -93,7 +114,24 @@ const upload = multer({
 });
 
 const app = express();
-app.use(cors());
+
+// CORS configuration
+// In production, set FRONTEND_URL environment variable (e.g., https://your-app.vercel.app)
+// For local development, allow localhost origins
+const corsOptions = {
+  origin: process.env.FRONTEND_URL 
+    ? process.env.FRONTEND_URL.split(',') // Support multiple origins (comma-separated)
+    : [
+        'http://localhost:3000', // Next.js default
+        'http://localhost:3001', // Alternative port
+        'http://127.0.0.1:3000',
+      ],
+  credentials: true, // Allow cookies/auth headers if needed
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+};
+
+app.use(cors(corsOptions));
 
 app.get("/", (req, res) => {
   return res.json({ status: "All good!" });
@@ -106,14 +144,27 @@ app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    // Enqueuing all the files to the queue for processing
-    // Fixed: Changed "file-ready" to "file-upload-queue" to match worker queue name
+    // Upload to Cloudinary
+    console.log("Uploading file to Cloudinary...");
+    const cloudinaryResult = await uploadPDFToCloudinary(
+      req.file.buffer,
+      req.file.originalname
+    );
+
+    // Enqueue job with Cloudinary URL instead of local path
     await queue.add("file-upload-queue", {
       filename: req.file.originalname,
-      destination: req.file.destination,
-      path: req.file.path,
+      cloudinaryUrl: cloudinaryResult.secure_url,
+      cloudinaryPublicId: cloudinaryResult.public_id,
+      // Keep path for backward compatibility, but it's now a Cloudinary URL
+      path: cloudinaryResult.secure_url,
     });
-    return res.json({ message: "File uploaded successfully!" });
+
+    console.log("File uploaded to Cloudinary and queued for processing");
+    return res.json({ 
+      message: "File uploaded successfully!",
+      cloudinaryUrl: cloudinaryResult.secure_url,
+    });
   } catch (error) {
     console.error("Error uploading file:", error);
     // Handle multer errors (file size, type, etc.)
@@ -124,6 +175,10 @@ app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
           .json({ error: "File too large. Maximum size is 10MB" });
       }
       return res.status(400).json({ error: error.message });
+    }
+    // Handle Cloudinary errors
+    if (error.message?.includes("Cloudinary")) {
+      return res.status(500).json({ error: "Failed to upload file to cloud storage" });
     }
     return res.status(500).json({ error: "Failed to upload file" });
   }
@@ -206,4 +261,7 @@ app.use((error, req, res, next) => {
   next();
 });
 
-app.listen(8000, () => console.log(`Server started on port: ${8000}`));
+// Use environment variable for port (required by most cloud platforms)
+// Falls back to 8000 for local development
+const PORT = process.env.PORT || 8000;
+app.listen(PORT, () => console.log(`Server started on port: ${PORT}`));

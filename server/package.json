@@ -7,7 +7,10 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "node --watch index.js",
-    "dev:worker": "node --watch worker.js"
+    "dev:worker": "node --watch worker.js",
+    "start": "node index.js",
+    "start:worker": "node worker.js",
+    "start:all": "concurrently \"npm run start\" \"npm run start:worker\""
   },
   "keywords": [],
   "author": "",
@@ -20,6 +23,7 @@
     "@langchain/qdrant": "^1.0.1",
     "@langchain/textsplitters": "^1.0.1",
     "bullmq": "^5.66.4",
+    "cloudinary": "^2.8.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "~4.22.1",

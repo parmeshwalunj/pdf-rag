@@ -3,7 +3,25 @@ services:
     image: valkey/valkey 
     ports:
       - 6379:6379
+    volumes:
+      # Persist Redis/Valkey data across container restarts
+      - valkey-data:/data
+    command: valkey-server --appendonly yes
+    restart: unless-stopped
+
   qdrant:
     image: qdrant/qdrant
     ports: 
       - 6333:6333
+      - 6334:6334  # gRPC port (optional, for better performance)
+    volumes:
+      # Persist Qdrant vector database data across container restarts
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+# Named volumes for data persistence
+volumes:
+  valkey-data:
+    driver: local
+  qdrant-data:
+    driver: local
