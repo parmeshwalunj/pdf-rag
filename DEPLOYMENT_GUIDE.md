@@ -63,12 +63,14 @@ If everything works locally, you're ready to deploy!
 ### 2.2 Set Up Qdrant Cloud (Free Tier)
 
 **Option A: Qdrant Cloud (Recommended)**
+
 1. Go to [https://cloud.qdrant.io](https://cloud.qdrant.io)
 2. Sign up (free tier: 1GB storage)
 3. Create a new cluster
 4. Copy the cluster URL
 
 **Option B: Keep Local Qdrant (for now)**
+
 - You can keep using local Qdrant if you're deploying backend locally
 - For cloud deployment, use Qdrant Cloud
 
@@ -83,17 +85,25 @@ If everything works locally, you're ready to deploy!
 1. **Sign up at [render.com](https://render.com)**
 
 2. **Deploy Server:**
+
    - Click "New" → "Web Service"
    - Connect your GitHub repository
    - Settings:
      - **Name:** `pdf-rag-server`
-     - **Root Directory:** `server`
+     - **Root Directory:** `server` ⚠️ **IMPORTANT: Make sure this is set!**
      - **Environment:** `Node`
-     - **Build Command:** `pnpm install`
-     - **Start Command:** `pnpm start`
+     - **Build Command:** `cd server && pnpm install` (if Root Directory doesn't work, use this)
+     - **Start Command:** `pnpm start` (or `cd server && pnpm start` if Root Directory doesn't work)
      - **Plan:** Free (or paid for better performance)
 
+   **⚠️ Troubleshooting:** If you get "No package.json found" error:
+
+   - Double-check **Root Directory** is set to `server` (not empty, not `/server`, just `server`)
+   - OR use build command: `cd server && pnpm install`
+   - OR use start command: `cd server && pnpm start`
+
 3. **Set Environment Variables:**
+
    ```
    OPENAI_API_KEY=sk-proj-...
    QDRANT_URL=https://your-cluster.qdrant.io
@@ -106,9 +116,23 @@ If everything works locally, you're ready to deploy!
    REDIS_TLS=true
    PORT=8000
    ```
+
    (Render sets PORT automatically, but include it anyway)
 
-4. **Deploy Worker (Separate Service):**
+4. **Run Worker in Same Service (FREE Option - Recommended):**
+
+   **⚠️ IMPORTANT:** Render Background Workers require a paid plan ($7/month).
+   **Free Alternative:** Run both server and worker in the same service!
+
+   **Update your existing service:**
+
+   - Go to your `pdf-rag-server` service settings
+   - Update **Start Command** to: `pnpm run start:all`
+   - This runs both server and worker together (free!)
+   - Save and redeploy
+
+   **OR Deploy Worker Separately (PAID - $7/month):**
+
    - Click "New" → "Background Worker"
    - Connect same repository
    - Settings:
@@ -118,6 +142,7 @@ If everything works locally, you're ready to deploy!
      - **Build Command:** `pnpm install`
      - **Start Command:** `pnpm run start:worker`
    - **Set same environment variables** (except PORT - not needed for worker)
+   - **⚠️ Requires payment method**
 
 5. **Get your backend URL:**
    - Server URL: `https://pdf-rag-server.onrender.com`
@@ -128,6 +153,7 @@ If everything works locally, you're ready to deploy!
 1. **Sign up at [railway.app](https://railway.app)**
 
 2. **Deploy Server:**
+
    - Click "New Project" → "Deploy from GitHub"
    - Select your repository
    - Add service → Select `server` directory
@@ -136,6 +162,7 @@ If everything works locally, you're ready to deploy!
    - Add environment variables (same as Render)
 
 3. **Deploy Worker:**
+
    - Add another service → Same repository
    - **Root Directory:** `server`
    - **Start Command:** `pnpm run start:worker`
@@ -152,20 +179,24 @@ If everything works locally, you're ready to deploy!
 1. **Sign up at [vercel.com](https://vercel.com)**
 
 2. **Import Project:**
+
    - Click "Add New" → "Project"
    - Import from GitHub
    - Select your repository
 
 3. **Configure:**
+
    - **Root Directory:** `client`
    - **Framework Preset:** Next.js
    - **Build Command:** `pnpm build` (or leave default)
    - **Output Directory:** `.next`
 
 4. **Set Environment Variables:**
+
    ```
    NEXT_PUBLIC_API_URL=https://your-backend.onrender.com
    ```
+
    (Replace with your actual backend URL from Step 3)
 
 5. **Deploy:**
@@ -190,14 +221,17 @@ FRONTEND_URL=https://your-app.vercel.app
 ### 5.2 Verify Environment Variables
 
 **Backend (Server):**
+
 - ✅ All required variables set
 - ✅ `FRONTEND_URL` set to Vercel URL
 
 **Backend (Worker):**
+
 - ✅ All required variables set
 - ✅ Same Redis connection as server
 
 **Frontend:**
+
 - ✅ `NEXT_PUBLIC_API_URL` set to backend URL
 
 ---
@@ -207,6 +241,7 @@ FRONTEND_URL=https://your-app.vercel.app
 1. **Visit your Vercel URL:** `https://your-app.vercel.app`
 
 2. **Test the flow:**
+
    - Upload a PDF
    - Wait for processing (check worker logs in Render/Railway)
    - Ask a question in the chat
@@ -221,21 +256,25 @@ FRONTEND_URL=https://your-app.vercel.app
 ## 🐛 Troubleshooting
 
 ### Backend not starting?
+
 - Check environment variables are all set
 - Check logs in Render/Railway dashboard
 - Verify Redis connection (Upstash dashboard)
 
 ### Worker not processing?
+
 - Check worker logs
 - Verify Redis connection
 - Check Qdrant connection
 
 ### Frontend can't connect to backend?
+
 - Check `NEXT_PUBLIC_API_URL` is correct
 - Check backend CORS settings (`FRONTEND_URL`)
 - Check backend is running (visit backend URL directly)
 
 ### CORS errors?
+
 - Make sure `FRONTEND_URL` in backend matches your Vercel URL exactly
 - Check browser console for specific error
 
@@ -244,6 +283,7 @@ FRONTEND_URL=https://your-app.vercel.app
 ## 📊 Monitoring
 
 ### Free Monitoring Options:
+
 - **Render:** Built-in logs and metrics
 - **Railway:** Built-in logs
 - **Vercel:** Built-in analytics
@@ -276,12 +316,14 @@ FRONTEND_URL=https://your-app.vercel.app
 ## 📝 Quick Reference
 
 ### Backend URLs:
+
 - Server: `https://your-backend.onrender.com`
 - Health check: `https://your-backend.onrender.com/`
 
 ### Environment Variables Summary:
 
 **Backend Server:**
+
 ```
 OPENAI_API_KEY
 QDRANT_URL
@@ -296,6 +338,7 @@ FRONTEND_URL
 ```
 
 **Backend Worker:**
+
 ```
 OPENAI_API_KEY
 QDRANT_URL
@@ -306,6 +349,7 @@ REDIS_TLS=true
 ```
 
 **Frontend:**
+
 ```
 NEXT_PUBLIC_API_URL
 ```
@@ -313,4 +357,3 @@ NEXT_PUBLIC_API_URL
 ---
 
 Good luck with your deployment! 🚀
-
