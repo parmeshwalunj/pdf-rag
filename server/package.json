@@ -24,6 +24,7 @@
     "@langchain/textsplitters": "^1.0.1",
     "bullmq": "^5.66.4",
     "cloudinary": "^2.8.0",
+    "concurrently": "^9.2.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "~4.22.1",
