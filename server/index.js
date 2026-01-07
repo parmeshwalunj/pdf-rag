@@ -19,26 +19,26 @@ dotenv.config({ path: join(__dirname, ".env") });
 // Environment Variable Validation
 // ============================================
 const requiredEnvVars = [
-  'OPENAI_API_KEY',
-  'QDRANT_URL',
-  'CLOUDINARY_CLOUD_NAME',
-  'CLOUDINARY_API_KEY',
-  'CLOUDINARY_API_SECRET',
+  "OPENAI_API_KEY",
+  "QDRANT_URL",
+  "CLOUDINARY_CLOUD_NAME",
+  "CLOUDINARY_API_KEY",
+  "CLOUDINARY_API_SECRET",
 ];
 
-const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
 
 if (missingVars.length > 0) {
-  console.error('❌ Missing required environment variables:');
-  missingVars.forEach(varName => {
+  console.error("❌ Missing required environment variables:");
+  missingVars.forEach((varName) => {
     console.error(`   - ${varName}`);
   });
-  console.error('\nPlease set these in your .env file or environment.');
-  console.error('See .env.example for reference.\n');
+  console.error("\nPlease set these in your .env file or environment.");
+  console.error("See .env.example for reference.\n");
   process.exit(1);
 }
 
-console.log('✅ All required environment variables are set');
+console.log("✅ All required environment variables are set");
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -47,14 +47,47 @@ const client = new OpenAI({
 // Redis/Valkey connection configuration
 // Use environment variables for production (e.g., Upstash Redis)
 // Falls back to localhost for local development
-const queue = new Queue("file-upload-queue", {
-  connection: {
-    host: process.env.REDIS_HOST || "localhost",
-    port: parseInt(process.env.REDIS_PORT || "6379", 10),
-    // For production Redis services (Upstash, Redis Cloud, etc.), you may need:
-    // password: process.env.REDIS_PASSWORD,
-    // tls: process.env.REDIS_TLS === "true" ? {} : undefined,
+const redisConnection = {
+  host: process.env.REDIS_HOST || "localhost",
+  port: parseInt(process.env.REDIS_PORT || "6379", 10),
+  // For production Redis services (Upstash, Redis Cloud, etc.)
+  ...(process.env.REDIS_PASSWORD && { password: process.env.REDIS_PASSWORD }),
+  ...(process.env.REDIS_TLS === "true" && {
+    tls: {
+      // Upstash requires TLS but doesn't need certificate verification
+      rejectUnauthorized: false,
+    },
+  }),
+  // Connection retry settings for better reliability
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    console.log(`Redis connection retry attempt ${times}, waiting ${delay}ms`);
+    return delay;
   },
+  maxRetriesPerRequest: 3,
+  enableReadyCheck: true,
+  lazyConnect: false,
+};
+
+console.log("Redis connection config:", {
+  host: redisConnection.host,
+  port: redisConnection.port,
+  hasPassword: !!redisConnection.password,
+  hasTLS: !!redisConnection.tls,
+});
+
+const queue = new Queue("file-upload-queue", {
+  connection: redisConnection,
+});
+
+// Handle Redis connection errors
+queue.on("error", (error) => {
+  console.error("Queue Redis connection error:", error);
+});
+
+// Log when queue is ready
+queue.on("ready", () => {
+  console.log("✅ Queue connected to Redis successfully");
 });
 
 // Cache vector store connections to avoid recreating on each request
@@ -119,16 +152,16 @@ const app = express();
 // In production, set FRONTEND_URL environment variable (e.g., https://your-app.vercel.app)
 // For local development, allow localhost origins
 const corsOptions = {
-  origin: process.env.FRONTEND_URL 
-    ? process.env.FRONTEND_URL.split(',') // Support multiple origins (comma-separated)
+  origin: process.env.FRONTEND_URL
+    ? process.env.FRONTEND_URL.split(",") // Support multiple origins (comma-separated)
     : [
-        'http://localhost:3000', // Next.js default
-        'http://localhost:3001', // Alternative port
-        'http://127.0.0.1:3000',
+        "http://localhost:3000", // Next.js default
+        "http://localhost:3001", // Alternative port
+        "http://127.0.0.1:3000",
       ],
   credentials: true, // Allow cookies/auth headers if needed
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));
@@ -161,7 +194,7 @@ app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
     });
 
     console.log("File uploaded to Cloudinary and queued for processing");
-    return res.json({ 
+    return res.json({
       message: "File uploaded successfully!",
       cloudinaryUrl: cloudinaryResult.secure_url,
     });
@@ -178,7 +211,9 @@ app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
     }
     // Handle Cloudinary errors
     if (error.message?.includes("Cloudinary")) {
-      return res.status(500).json({ error: "Failed to upload file to cloud storage" });
+      return res
+        .status(500)
+        .json({ error: "Failed to upload file to cloud storage" });
     }
     return res.status(500).json({ error: "Failed to upload file" });
   }
@@ -234,11 +269,9 @@ Context: ${JSON.stringify(result)}
       error.message?.includes("ECONNREFUSED") ||
       error.message?.includes("connect")
     ) {
-      return res
-        .status(503)
-        .json({
-          error: "Vector database is unavailable. Please try again later.",
-        });
+      return res.status(503).json({
+        error: "Vector database is unavailable. Please try again later.",
+      });
     }
     return res.status(500).json({ error: "Failed to process chat request" });
   }

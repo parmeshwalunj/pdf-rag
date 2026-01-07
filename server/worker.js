@@ -313,9 +313,37 @@ const worker = new Worker(
       // Falls back to localhost for local development
       host: process.env.REDIS_HOST || "localhost",
       port: parseInt(process.env.REDIS_PORT || "6379", 10),
-      // For production Redis services (Upstash, Redis Cloud, etc.), you may need:
-      // password: process.env.REDIS_PASSWORD,
-      // tls: process.env.REDIS_TLS === "true" ? {} : undefined,
+      // For production Redis services (Upstash, Redis Cloud, etc.)
+      ...(process.env.REDIS_PASSWORD && {
+        password: process.env.REDIS_PASSWORD,
+      }),
+      ...(process.env.REDIS_TLS === "true" && {
+        tls: {
+          // Upstash requires TLS but doesn't need certificate verification
+          rejectUnauthorized: false,
+        },
+      }),
+      // Connection retry settings for better reliability
+      retryStrategy: (times) => {
+        const delay = Math.min(times * 50, 2000);
+        console.log(
+          `Redis connection retry attempt ${times}, waiting ${delay}ms`
+        );
+        return delay;
+      },
+      maxRetriesPerRequest: 3,
+      enableReadyCheck: true,
+      lazyConnect: false,
     },
   }
 );
+
+// Handle Redis connection errors
+worker.on("error", (error) => {
+  console.error("Worker Redis connection error:", error);
+});
+
+// Log when worker is ready
+worker.on("ready", () => {
+  console.log("✅ Worker connected to Redis successfully");
+});
