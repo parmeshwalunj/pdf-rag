@@ -11,6 +11,9 @@ node_modules/
 # Testing
 coverage/
 
+# Files uploaded to local storage
+uploads/
+temp/
 # Next.js
 .next/
 out/
@@ -68,5 +71,4 @@ ENV/
 # Server specific (adjust based on your server stack)
 *.log
 .cache/
-server/uploads/
 

@@ -2,18 +2,37 @@ import dotenv from "dotenv";
 import { Worker } from "bullmq";
 import { QdrantVectorStore } from "@langchain/qdrant";
 import { OpenAIEmbeddings } from "@langchain/openai";
-import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { Document } from "@langchain/core/documents";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
+import pdfParse from "pdf-parse";
+import { downloadFromCloudinary } from "./services/cloudinary.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Load .env file from the server directory
 dotenv.config({ path: join(__dirname, ".env") });
+
+// ============================================
+// Environment Variable Validation
+// ============================================
+const requiredEnvVars = ["OPENAI_API_KEY", "QDRANT_URL"];
+
+const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  console.error("❌ Missing required environment variables:");
+  missingVars.forEach((varName) => {
+    console.error(`   - ${varName}`);
+  });
+  console.error("\nPlease set these in your .env file or environment.");
+  process.exit(1);
+}
+
+console.log("✅ Worker: All required environment variables are set");
 
 const worker = new Worker(
   "file-upload-queue",
@@ -31,40 +50,78 @@ const worker = new Worker(
         store the embeddings in the qdrant vector store
         */
 
-      // Resolve the absolute path
-      const filePath = join(__dirname, data.path);
-      console.log(`Loading PDF from: ${filePath}`);
+      // PRODUCTION-READY: Parse PDF directly from buffer (no temp files!)
+      // This approach:
+      // - Avoids disk I/O
+      // - No cleanup needed
+      // - Works in serverless/containers
+      // - Better for horizontal scaling
+      let pdfBuffer;
 
-      // Check if file exists
-      if (!existsSync(filePath)) {
-        throw new Error(`File not found: ${filePath}`);
+      if (data.cloudinaryUrl || data.path?.startsWith("http")) {
+        // Download from Cloudinary URL
+        const cloudinaryUrl = data.cloudinaryUrl || data.path;
+        console.log(`Downloading PDF from Cloudinary: ${cloudinaryUrl}`);
+        pdfBuffer = await downloadFromCloudinary(cloudinaryUrl);
+        console.log(`PDF downloaded, buffer size: ${pdfBuffer.length} bytes`);
+      } else {
+        // Local file path (backward compatibility)
+        const filePath = join(__dirname, data.path);
+        console.log(`Loading PDF from local path: ${filePath}`);
+
+        if (!existsSync(filePath)) {
+          throw new Error(`File not found: ${filePath}`);
+        }
+
+        pdfBuffer = readFileSync(filePath);
+        console.log(
+          `PDF loaded from disk, buffer size: ${pdfBuffer.length} bytes`
+        );
       }
 
-      // Load the PDF
-      const loader = new PDFLoader(filePath);
-      console.log("PDF loader created, loading documents...");
-      const docs = await loader.load();
-      console.log(`Loaded ${docs.length} documents (pages)`);
+      // Parse PDF directly from buffer using pdf-parse
+      // This is the industry-preferred approach - no temp files needed!
+      console.log("Parsing PDF from buffer...");
+      const pdfData = await pdfParse(pdfBuffer);
 
-      // Log some sample document sizes to understand the data
-      const sampleSizes = docs.slice(0, 5).map((doc, idx) => ({
-        page: idx + 1,
-        length: doc.pageContent?.length || 0,
-      }));
-      console.log("Sample document sizes (first 5 pages):", sampleSizes);
-      const totalChars = docs.reduce(
-        (sum, doc) => sum + (doc.pageContent?.length || 0),
-        0
+      // pdf-parse returns a single object with all text
+      // We need to split it into pages (similar to PDFLoader behavior)
+      // Note: pdf-parse doesn't provide per-page text, so we'll treat it as one document
+      // and let the text splitter handle chunking
+      const pageContent = pdfData.text;
+      const totalPages = pdfData.numpages;
+
+      console.log(
+        `PDF parsed: ${totalPages} pages, ${pageContent.length} characters`
       );
-      console.log(`Total characters across all pages: ${totalChars}`);
+
+      // Create Document objects (similar to PDFLoader output)
+      // Since pdf-parse doesn't split by page, we create a single document
+      // The text splitter will handle proper chunking
+      const docs = [
+        new Document({
+          pageContent: pageContent,
+          metadata: {
+            source: data.cloudinaryUrl || data.path || data.filename,
+            totalPages: totalPages,
+            pdfInfo: {
+              title: pdfData.info?.Title || null,
+              author: pdfData.info?.Author || null,
+              creator: pdfData.info?.Creator || null,
+            },
+          },
+        }),
+      ];
+
+      console.log(`Created ${docs.length} document(s) from PDF`);
+
+      // Log document info
+      const totalChars = docs[0].pageContent.length;
+      console.log(`Total characters in PDF: ${totalChars}`);
 
       // Split documents into chunks for better retrieval
-      // IMPORTANT: We need to split by character count, not by pages
-      // Strategy: Combine all pages into one document, then split it properly
-      // This ensures chunks are based on character count with proper overlap
-
-      // Use RecursiveCharacterTextSplitter instead of CharacterTextSplitter
-      // It's smarter - tries to split on paragraphs, then sentences, then words, then characters
+      // Use RecursiveCharacterTextSplitter - it's smarter:
+      // Tries to split on paragraphs, then sentences, then words, then characters
       // This ensures we get chunks close to the target size even if paragraphs are large
       const textSplitter = new RecursiveCharacterTextSplitter({
         chunkSize: 1000, // Target characters per chunk
@@ -72,23 +129,9 @@ const worker = new Worker(
         separators: ["\n\n", "\n", ". ", " ", ""], // Try these separators in order
       });
 
-      // Combine all page documents into one large document
-      // This way splitDocuments will properly chunk by character count with overlap
-      const combinedText = docs.map((doc) => doc.pageContent).join("\n\n");
-      console.log(`Combined text length: ${combinedText.length} characters`);
-
-      // Create a single combined document
-      const combinedDoc = new Document({
-        pageContent: combinedText,
-        metadata: {
-          ...docs[0]?.metadata,
-          source: data.path,
-          totalPages: docs.length,
-        },
-      });
-
-      // Now split this single document
-      let chunks = await textSplitter.splitDocuments([combinedDoc]);
+      // Split the document into chunks
+      // Since pdf-parse gives us a single document, we can split it directly
+      let chunks = await textSplitter.splitDocuments(docs);
       console.log(
         `Initial split: ${chunks.length} chunks (before overlap enforcement)`
       );
@@ -129,6 +172,7 @@ const worker = new Worker(
             totalChunks: chunks.length,
             chunkSize: chunkText.length,
             hasOverlap: i > 0, // Mark if this chunk has overlap from previous
+            source: data.cloudinaryUrl || data.path || data.filename,
           },
         });
 
@@ -247,8 +291,12 @@ const worker = new Worker(
       // Use chunks instead of full documents for better retrieval
       await vectorStore.addDocuments(chunks);
       console.log(`Added ${chunks.length} chunks to the vector store`);
+
+      // No cleanup needed! We used buffer directly - no temp files created
+      console.log("PDF processing completed successfully");
     } catch (error) {
       console.error("Error processing file:", error);
+      // No cleanup needed - we don't create temp files anymore!
       throw error; // Re-throw to mark job as failed
     }
   },
@@ -260,8 +308,14 @@ const worker = new Worker(
     // - System overload
     concurrency: 3,
     connection: {
-      host: "localhost",
-      port: 6379,
+      // Redis/Valkey connection configuration
+      // Use environment variables for production (e.g., Upstash Redis)
+      // Falls back to localhost for local development
+      host: process.env.REDIS_HOST || "localhost",
+      port: parseInt(process.env.REDIS_PORT || "6379", 10),
+      // For production Redis services (Upstash, Redis Cloud, etc.), you may need:
+      // password: process.env.REDIS_PASSWORD,
+      // tls: process.env.REDIS_TLS === "true" ? {} : undefined,
     },
   }
 );
