@@ -121,6 +121,8 @@ const getVectorStore = async () => {
     {
       url: process.env.QDRANT_URL,
       collectionName: "pdf-docs",
+      // Qdrant Cloud requires API key for authentication
+      ...(process.env.QDRANT_API_KEY && { apiKey: process.env.QDRANT_API_KEY }),
     }
   );
 
