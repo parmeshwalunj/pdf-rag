@@ -153,14 +153,28 @@ const app = express();
 // CORS configuration
 // In production, set FRONTEND_URL environment variable (e.g., https://your-app.vercel.app)
 // For local development, allow localhost origins
+const allowedOrigins = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(",").map((url) => url.trim()) // Support multiple origins (comma-separated)
+  : [
+      "http://localhost:3000", // Next.js default
+      "http://localhost:3001", // Alternative port
+      "http://127.0.0.1:3000",
+    ];
+
+console.log("CORS allowed origins:", allowedOrigins);
+
 const corsOptions = {
-  origin: process.env.FRONTEND_URL
-    ? process.env.FRONTEND_URL.split(",") // Support multiple origins (comma-separated)
-    : [
-        "http://localhost:3000", // Next.js default
-        "http://localhost:3001", // Alternative port
-        "http://127.0.0.1:3000",
-      ],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.warn(`CORS blocked origin: ${origin}`);
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
   credentials: true, // Allow cookies/auth headers if needed
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
