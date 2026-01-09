@@ -175,7 +175,7 @@ export default function ChatComponent() {
             )}
           </Button>
         </div>
-      </div>
+        </div>
     </div>
   )
 }

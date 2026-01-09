@@ -9,6 +9,7 @@ import { QdrantVectorStore } from "@langchain/qdrant";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { OpenAI } from "openai";
 import { uploadPDFToCloudinary } from "./services/cloudinary.js";
+import { clerkMiddleware, requireAuth } from "@clerk/express";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -24,6 +25,7 @@ const requiredEnvVars = [
   "CLOUDINARY_CLOUD_NAME",
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
+  "CLERK_SECRET_KEY",
 ];
 
 const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
@@ -182,61 +184,88 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Clerk authentication middleware
+// This validates JWT tokens and attaches user info to req.auth
+app.use(clerkMiddleware());
+
+// Health check endpoint (no auth required)
 app.get("/", (req, res) => {
   return res.json({ status: "All good!" });
 });
 
-app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
-  try {
-    // Validate file was uploaded
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    // Upload to Cloudinary
-    console.log("Uploading file to Cloudinary...");
-    const cloudinaryResult = await uploadPDFToCloudinary(
-      req.file.buffer,
-      req.file.originalname
-    );
-
-    // Enqueue job with Cloudinary URL instead of local path
-    await queue.add("file-upload-queue", {
-      filename: req.file.originalname,
-      cloudinaryUrl: cloudinaryResult.secure_url,
-      cloudinaryPublicId: cloudinaryResult.public_id,
-      // Keep path for backward compatibility, but it's now a Cloudinary URL
-      path: cloudinaryResult.secure_url,
-    });
-
-    console.log("File uploaded to Cloudinary and queued for processing");
-    return res.json({
-      message: "File uploaded successfully!",
-      cloudinaryUrl: cloudinaryResult.secure_url,
-    });
-  } catch (error) {
-    console.error("Error uploading file:", error);
-    // Handle multer errors (file size, type, etc.)
-    if (error instanceof multer.MulterError) {
-      if (error.code === "LIMIT_FILE_SIZE") {
-        return res
-          .status(400)
-          .json({ error: "File too large. Maximum size is 10MB" });
+// Protected routes - require authentication
+app.post(
+  "/upload/pdf",
+  requireAuth(),
+  upload.single("pdf"),
+  async (req, res) => {
+    try {
+      // Extract userId from Clerk session
+      const userId = req.auth.userId;
+      if (!userId) {
+        return res.status(401).json({ error: "Authentication required" });
       }
-      return res.status(400).json({ error: error.message });
-    }
-    // Handle Cloudinary errors
-    if (error.message?.includes("Cloudinary")) {
-      return res
-        .status(500)
-        .json({ error: "Failed to upload file to cloud storage" });
-    }
-    return res.status(500).json({ error: "Failed to upload file" });
-  }
-});
 
-app.get("/chat", async (req, res) => {
+      // Validate file was uploaded
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      // Upload to Cloudinary
+      console.log(`Uploading file to Cloudinary for user: ${userId}...`);
+      const cloudinaryResult = await uploadPDFToCloudinary(
+        req.file.buffer,
+        req.file.originalname,
+        userId // Pass userId for folder organization
+      );
+
+      // Enqueue job with Cloudinary URL and userId
+      await queue.add("file-upload-queue", {
+        userId: userId, // Add userId to job data
+        filename: req.file.originalname,
+        cloudinaryUrl: cloudinaryResult.secure_url,
+        cloudinaryPublicId: cloudinaryResult.public_id,
+        // Keep path for backward compatibility, but it's now a Cloudinary URL
+        path: cloudinaryResult.secure_url,
+      });
+
+      console.log(
+        `File uploaded to Cloudinary and queued for processing (user: ${userId})`
+      );
+      return res.json({
+        message: "File uploaded successfully!",
+        cloudinaryUrl: cloudinaryResult.secure_url,
+      });
+    } catch (error) {
+      console.error("Error uploading file:", error);
+      // Handle multer errors (file size, type, etc.)
+      if (error instanceof multer.MulterError) {
+        if (error.code === "LIMIT_FILE_SIZE") {
+          return res
+            .status(400)
+            .json({ error: "File too large. Maximum size is 10MB" });
+        }
+        return res.status(400).json({ error: error.message });
+      }
+      // Handle Cloudinary errors
+      if (error.message?.includes("Cloudinary")) {
+        return res
+          .status(500)
+          .json({ error: "Failed to upload file to cloud storage" });
+      }
+      return res.status(500).json({ error: "Failed to upload file" });
+    }
+  }
+);
+
+app.get("/chat", requireAuth(), async (req, res) => {
   try {
+    // Extract userId from Clerk session
+    const userId = req.auth.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
     const userQuery = req.query.message;
 
     // Validate query parameter
@@ -250,11 +279,48 @@ app.get("/chat", async (req, res) => {
         .json({ error: "Message query parameter is required" });
     }
 
+    // Parse pdfIds from query (optional - for multi-select)
+    let pdfIds = [];
+    if (req.query.pdfIds) {
+      try {
+        pdfIds = JSON.parse(req.query.pdfIds);
+        if (!Array.isArray(pdfIds)) {
+          pdfIds = [];
+        }
+      } catch (e) {
+        console.warn("Invalid pdfIds format, ignoring:", e);
+        pdfIds = [];
+      }
+    }
+
     // Get cached vector store (or create if first request)
     const vectorStore = await getVectorStore();
 
+    // Build Qdrant filter
+    const filter = {
+      must: [
+        {
+          key: "userId",
+          match: {
+            value: userId,
+          },
+        },
+      ],
+    };
+
+    // Add pdfIds filter if provided
+    if (pdfIds.length > 0) {
+      filter.must.push({
+        key: "pdfId",
+        match: {
+          any: pdfIds,
+        },
+      });
+    }
+
     const ret = vectorStore.asRetriever({
-      k: 2,
+      k: 5,
+      filter: filter,
     });
     const result = await ret.invoke(userQuery);
 

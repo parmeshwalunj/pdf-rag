@@ -28,9 +28,32 @@ export interface ApiError {
 
 class ApiClient {
   private baseUrl: string;
+  private getToken: (() => Promise<string | null>) | null = null;
 
   constructor(baseUrl: string = API_BASE) {
     this.baseUrl = baseUrl;
+  }
+
+  /**
+   * Set the token getter function (called from components with useAuth hook)
+   */
+  setTokenGetter(getTokenFn: () => Promise<string | null>) {
+    this.getToken = getTokenFn;
+  }
+
+  /**
+   * Get auth token from Clerk session
+   */
+  private async getAuthToken(): Promise<string | null> {
+    if (this.getToken) {
+      try {
+        return await this.getToken();
+      } catch (error) {
+        console.error('Failed to get auth token:', error);
+        return null;
+      }
+    }
+    return null;
   }
 
   private async request<T>(
@@ -39,13 +62,21 @@ class ApiClient {
   ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
     
+    // Get auth token and add to headers
+    const token = await this.getAuthToken();
+    const headers: HeadersInit = {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    };
+
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    
     try {
       const response = await fetch(url, {
         ...options,
-        headers: {
-          'Content-Type': 'application/json',
-          ...options.headers,
-        },
+        headers,
       });
 
       if (!response.ok) {
@@ -71,9 +102,17 @@ class ApiClient {
     const formData = new FormData();
     formData.append('pdf', file);
 
+    // Get auth token
+    const token = await this.getAuthToken();
+    const headers: HeadersInit = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     const response = await fetch(`${this.baseUrl}/upload/pdf`, {
       method: 'POST',
       body: formData,
+      headers,
       // Don't set Content-Type header - browser will set it with boundary
     });
 
@@ -89,11 +128,19 @@ class ApiClient {
 
   /**
    * Send a chat message and get response
+   * @param message - User's question
+   * @param pdfIds - Array of PDF IDs to include in context (optional)
    */
-  async chat(message: string): Promise<ChatResponse> {
-    return this.request<ChatResponse>(
-      `/chat?message=${encodeURIComponent(message)}`
-    );
+  async chat(message: string, pdfIds?: string[]): Promise<ChatResponse> {
+    const params = new URLSearchParams({
+      message: message,
+    });
+    
+    if (pdfIds && pdfIds.length > 0) {
+      params.append('pdfIds', JSON.stringify(pdfIds));
+    }
+    
+    return this.request<ChatResponse>(`/chat?${params.toString()}`);
   }
 
   /**
