@@ -11,8 +11,13 @@ interface Doc{
     metadata?: {
         loc?: {
             pageNumber?: number;
-        }
-        source?: string
+            lines?: {
+                from?: number;
+                to?: number;
+            };
+        };
+        source?: string;
+        [key: string]: any; // Allow other metadata fields
     }
 }
 
@@ -50,8 +55,15 @@ export default function ChatComponent({ selectedPDFIds = [] }: ChatComponentProp
     setMessages(prev => [...prev, {role: "user", content: userMessage}]);
 
     try {
+      // Validate that PDFs are selected
+      if (!selectedPDFIds || selectedPDFIds.length === 0) {
+        setError("Please select at least one PDF to chat with.");
+        setLoading(false);
+        return;
+      }
+
       // Pass selected PDF IDs to chat API
-      const data = await api.chat(userMessage, selectedPDFIds.length > 0 ? selectedPDFIds : undefined);
+      const data = await api.chat(userMessage, selectedPDFIds);
       
       // Validate response data
       if (!data || !data.result) {
@@ -111,18 +123,27 @@ export default function ChatComponent({ selectedPDFIds = [] }: ChatComponentProp
               {msg.documents && msg.documents.length > 0 && (
                 <div className="mt-2 pt-2 border-t border-gray-300 text-xs opacity-75">
                   <p className="font-semibold mb-1">Sources:</p>
-                  {msg.documents.map((doc, docIndex) => (
-                    <div key={docIndex} className="mb-1">
-                      {doc.metadata?.source && (
-                        <span className="italic">
-                          {doc.metadata.source.split('/').pop()}
-                        </span>
-                      )}
-                      {doc.metadata?.loc?.pageNumber && (
-                        <span className="ml-2">(Page {doc.metadata.loc.pageNumber})</span>
-                      )}
-                    </div>
-                  ))}
+                  {(() => {
+                    // Extract unique sources with their page numbers
+                    const sourceMap = new Map<string, Set<number>>();
+                    
+                    msg.documents.forEach((doc) => {
+                      if (doc.metadata?.source) {
+                        const sourceName = doc.metadata.source.split('/').pop() || doc.metadata.source;
+                        
+                        if (!sourceMap.has(sourceName)) {
+                          sourceMap.set(sourceName, new Set());
+                        }
+                      }
+                    });
+                    
+                    // Display unique sources (without page numbers for now)
+                    return Array.from(sourceMap.keys()).map((sourceName, index) => (
+                      <div key={index} className="mb-1">
+                        <span className="italic">{sourceName}</span>
+                      </div>
+                    ));
+                  })()}
                 </div>
               )}
             </div>

@@ -298,21 +298,183 @@ const worker = new Worker(
         apiKey: process.env.OPENAI_API_KEY,
       });
       console.log("embeddings created");
+
+      const qdrantUrl = process.env.QDRANT_URL;
+      const qdrantApiKey = process.env.QDRANT_API_KEY;
+
+      console.log(`[WORKER] Connecting to Qdrant:`, {
+        url: qdrantUrl,
+        collectionName: "pdf-docs",
+        hasApiKey: !!qdrantApiKey,
+      });
+
       const vectorStore = await QdrantVectorStore.fromExistingCollection(
         embeddings,
         {
-          url: process.env.QDRANT_URL,
+          url: qdrantUrl,
           collectionName: "pdf-docs",
           // Qdrant Cloud requires API key for authentication
-          ...(process.env.QDRANT_API_KEY && {
-            apiKey: process.env.QDRANT_API_KEY,
+          ...(qdrantApiKey && {
+            apiKey: qdrantApiKey,
           }),
         }
       );
-      console.log("vector store created");
+      console.log("[WORKER] Vector store created");
       // Use chunks instead of full documents for better retrieval
       await vectorStore.addDocuments(chunks);
       console.log(`Added ${chunks.length} chunks to the vector store`);
+
+      // Log sample metadata to verify userId and pdfId are set
+      if (chunks.length > 0) {
+        console.log(`[WORKER] Sample chunk metadata:`, {
+          userId: chunks[0].metadata?.userId,
+          pdfId: chunks[0].metadata?.pdfId,
+          hasUserId: !!chunks[0].metadata?.userId,
+          hasPdfId: !!chunks[0].metadata?.pdfId,
+        });
+      }
+
+      // VERIFICATION: Test query to verify chunks are stored and queryable
+      try {
+        console.log(`[WORKER] Verifying chunks are queryable...`);
+
+        // Test 1: Query without any filter (should return some results)
+        const noFilterRetriever = vectorStore.asRetriever({ k: 1 });
+        const noFilterResult = await noFilterRetriever.invoke("test");
+        console.log(
+          `[WORKER] Test 1 (no filter): ${
+            noFilterResult?.length || 0
+          } chunks found`
+        );
+        if (noFilterResult && noFilterResult.length > 0) {
+          console.log(
+            `[WORKER] Sample metadata (no filter):`,
+            JSON.stringify(noFilterResult[0]?.metadata || {}, null, 2)
+          );
+        }
+
+        // Test 2: Query with userId filter only - Try different filter formats
+        console.log(`[WORKER] Testing userId filter formats...`);
+
+        // Format 1: Standard format
+        const userIdFilter1 = {
+          must: [
+            {
+              key: "userId",
+              match: {
+                value: data.userId,
+              },
+            },
+          ],
+        };
+        const userIdRetriever1 = vectorStore.asRetriever({
+          k: 1,
+          filter: userIdFilter1,
+        });
+        const userIdResult1 = await userIdRetriever1.invoke("test");
+        console.log(
+          `[WORKER] Test 2a (userId filter - standard): ${
+            userIdResult1?.length || 0
+          } chunks found`
+        );
+
+        // Format 2: Using 'must' with nested structure
+        const userIdFilter2 = {
+          must: [
+            {
+              key: "metadata.userId",
+              match: {
+                value: data.userId,
+              },
+            },
+          ],
+        };
+        try {
+          const userIdRetriever2 = vectorStore.asRetriever({
+            k: 1,
+            filter: userIdFilter2,
+          });
+          const userIdResult2 = await userIdRetriever2.invoke("test");
+          console.log(
+            `[WORKER] Test 2b (userId filter - metadata.userId): ${
+              userIdResult2?.length || 0
+            } chunks found`
+          );
+        } catch (e) {
+          console.log(`[WORKER] Test 2b failed:`, e.message);
+        }
+
+        // Format 3: Try using similaritySearchWithScore directly (bypass retriever)
+        try {
+          const testEmbedding = await embeddings.embedQuery("test");
+          const results = await vectorStore.similaritySearchWithScore(
+            "test",
+            1,
+            {
+              filter: {
+                must: [
+                  {
+                    key: "userId",
+                    match: {
+                      value: data.userId,
+                    },
+                  },
+                ],
+              },
+            }
+          );
+          console.log(
+            `[WORKER] Test 2c (similaritySearchWithScore with filter): ${results.length} results`
+          );
+          if (results.length > 0) {
+            console.log(
+              `[WORKER] Result metadata:`,
+              JSON.stringify(results[0][0].metadata || {}, null, 2)
+            );
+          }
+        } catch (e) {
+          console.log(`[WORKER] Test 2c failed:`, e.message);
+        }
+
+        // Test 3: Query with userId + pdfId filter (using metadata prefix)
+        const fullFilter = {
+          must: [
+            {
+              key: "metadata.userId",
+              match: {
+                value: data.userId,
+              },
+            },
+            {
+              key: "metadata.pdfId",
+              match: {
+                value: data.pdfId,
+              },
+            },
+          ],
+        };
+        const fullRetriever = vectorStore.asRetriever({
+          k: 1,
+          filter: fullFilter,
+        });
+        const fullResult = await fullRetriever.invoke("test");
+        console.log(
+          `[WORKER] Test 3 (userId + pdfId filter): ${
+            fullResult?.length || 0
+          } chunks found`
+        );
+        if (fullResult && fullResult.length > 0) {
+          console.log(
+            `[WORKER] ✓ Chunks are queryable with userId + pdfId filter`
+          );
+        } else {
+          console.warn(
+            `[WORKER] ⚠ WARNING: Chunks added but not queryable with full filter!`
+          );
+        }
+      } catch (verifyError) {
+        console.error(`[WORKER] Error verifying chunks:`, verifyError);
+      }
 
       // Update status to 'completed' in Supabase with metadata
       if (data.databaseId && data.userId) {
