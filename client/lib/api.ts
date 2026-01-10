@@ -81,10 +81,28 @@ class ApiClient {
     
     // Get auth token and add to headers
     const token = await this.getAuthToken();
-    const headers: HeadersInit = {
-      'Content-Type': 'application/json',
-      ...options.headers,
-    };
+    const headers: Record<string, string> = {};
+
+    // Copy existing headers if they're a plain object
+    if (options.headers) {
+      if (options.headers instanceof Headers) {
+        options.headers.forEach((value, key) => {
+          headers[key] = value;
+        });
+      } else if (Array.isArray(options.headers)) {
+        options.headers.forEach(([key, value]) => {
+          headers[key] = value;
+        });
+      } else {
+        Object.assign(headers, options.headers);
+      }
+    }
+
+    // Only set Content-Type for requests with body (POST, PUT, PATCH)
+    const hasBody = options.body !== undefined;
+    if (hasBody && !headers['Content-Type']) {
+      headers['Content-Type'] = 'application/json';
+    }
 
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
@@ -97,15 +115,25 @@ class ApiClient {
       });
 
       if (!response.ok) {
-        const errorData: ApiError = await response.json().catch(() => ({
-          error: `Server error: ${response.status}`,
-        }));
+        let errorData: ApiError;
+        try {
+          errorData = await response.json();
+        } catch (e) {
+          // If response is not JSON, create error from status
+          errorData = {
+            error: `Server error: ${response.status} ${response.statusText}`,
+          };
+        }
         throw new Error(errorData.error || `Request failed: ${response.status}`);
       }
 
       return await response.json();
     } catch (error) {
       if (error instanceof Error) {
+        // Re-throw with more context for network errors
+        if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+          throw new Error('Network error: Failed to connect to server. Please check your connection.');
+        }
         throw error;
       }
       throw new Error('Network error: Failed to connect to server');
@@ -121,7 +149,7 @@ class ApiClient {
 
     // Get auth token
     const token = await this.getAuthToken();
-    const headers: HeadersInit = {};
+    const headers: Record<string, string> = {};
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
     }
