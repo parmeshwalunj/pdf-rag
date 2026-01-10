@@ -9,6 +9,7 @@ import { dirname, join } from "path";
 import { existsSync, readFileSync } from "fs";
 import pdfParse from "pdf-parse";
 import { downloadFromCloudinary } from "./services/cloudinary.js";
+import { updatePDFStatus } from "./services/database.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -42,6 +43,21 @@ const worker = new Worker(
       const data =
         typeof job.data === "string" ? JSON.parse(job.data) : job.data;
       console.log(`Processing file:`, data);
+
+      // Update status to 'processing' in Supabase
+      if (data.databaseId && data.userId) {
+        try {
+          await updatePDFStatus(data.databaseId, data.userId, {
+            upload_status: "processing",
+          });
+          console.log(
+            `PDF status updated to 'processing' (databaseId: ${data.databaseId})`
+          );
+        } catch (error) {
+          console.warn("Failed to update PDF status to 'processing':", error);
+          // Continue processing even if status update fails
+        }
+      }
       /*
         path is data.path which gives the path of the file where it is stored in the server
         read the pdf from path,
@@ -168,6 +184,8 @@ const worker = new Worker(
           pageContent: chunkText,
           metadata: {
             ...chunks[i].metadata,
+            userId: data.userId, // Add userId for filtering
+            pdfId: data.pdfId, // Add pdfId for filtering
             chunkIndex: i,
             totalChunks: chunks.length,
             chunkSize: chunkText.length,
@@ -296,10 +314,46 @@ const worker = new Worker(
       await vectorStore.addDocuments(chunks);
       console.log(`Added ${chunks.length} chunks to the vector store`);
 
+      // Update status to 'completed' in Supabase with metadata
+      if (data.databaseId && data.userId) {
+        try {
+          await updatePDFStatus(data.databaseId, data.userId, {
+            upload_status: "completed",
+            page_count: totalPages,
+            chunk_count: chunks.length,
+          });
+          console.log(
+            `PDF status updated to 'completed' (databaseId: ${data.databaseId}, pages: ${totalPages}, chunks: ${chunks.length})`
+          );
+        } catch (error) {
+          console.error("Failed to update PDF status to 'completed':", error);
+          // Don't throw - processing was successful, just status update failed
+        }
+      }
+
       // No cleanup needed! We used buffer directly - no temp files created
       console.log("PDF processing completed successfully");
     } catch (error) {
       console.error("Error processing file:", error);
+
+      // Update status to 'failed' in Supabase
+      if (data.databaseId && data.userId) {
+        try {
+          await updatePDFStatus(data.databaseId, data.userId, {
+            upload_status: "failed",
+            error_message: error.message || "Unknown error",
+          });
+          console.log(
+            `PDF status updated to 'failed' (databaseId: ${data.databaseId})`
+          );
+        } catch (updateError) {
+          console.error(
+            "Failed to update PDF status to 'failed':",
+            updateError
+          );
+        }
+      }
+
       // No cleanup needed - we don't create temp files anymore!
       throw error; // Re-throw to mark job as failed
     }
