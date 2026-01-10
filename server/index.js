@@ -9,6 +9,17 @@ import { QdrantVectorStore } from "@langchain/qdrant";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { OpenAI } from "openai";
 import { uploadPDFToCloudinary } from "./services/cloudinary.js";
+import { clerkMiddleware, requireAuth } from "@clerk/express";
+import {
+  createPDFRecord,
+  getUserPDFCount,
+  getUserPDFs,
+  getPDFById,
+  deletePDFRecord,
+  togglePDFActive,
+  validatePDFOwnership,
+} from "./services/database.js";
+import { v4 as uuidv4 } from "uuid";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -24,6 +35,10 @@ const requiredEnvVars = [
   "CLOUDINARY_CLOUD_NAME",
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
+  "CLERK_SECRET_KEY",
+  "CLERK_PUBLISHABLE_KEY", // Required by @clerk/express middleware
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
 ];
 
 const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
@@ -115,18 +130,27 @@ const getVectorStore = async () => {
     apiKey: process.env.OPENAI_API_KEY,
   });
 
+  const qdrantUrl = process.env.QDRANT_URL;
+  const qdrantApiKey = process.env.QDRANT_API_KEY;
+
+  console.log(`[SERVER] Connecting to Qdrant:`, {
+    url: qdrantUrl,
+    collectionName: "pdf-docs",
+    hasApiKey: !!qdrantApiKey,
+  });
+
   // Create and cache vector store connection
   cachedVectorStore = await QdrantVectorStore.fromExistingCollection(
     cachedEmbeddings,
     {
-      url: process.env.QDRANT_URL,
+      url: qdrantUrl,
       collectionName: "pdf-docs",
       // Qdrant Cloud requires API key for authentication
-      ...(process.env.QDRANT_API_KEY && { apiKey: process.env.QDRANT_API_KEY }),
+      ...(qdrantApiKey && { apiKey: qdrantApiKey }),
     }
   );
 
-  console.log("Vector store connection cached");
+  console.log("[SERVER] Vector store connection cached");
   return cachedVectorStore;
 };
 
@@ -176,67 +200,124 @@ const corsOptions = {
     }
   },
   credentials: true, // Allow cookies/auth headers if needed
-  methods: ["GET", "POST", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], // Added DELETE, PATCH, PUT
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));
 
+// Clerk authentication middleware
+// This validates JWT tokens and attaches user info to req.auth
+app.use(clerkMiddleware());
+
+// Health check endpoint (no auth required)
 app.get("/", (req, res) => {
   return res.json({ status: "All good!" });
 });
 
-app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
-  try {
-    // Validate file was uploaded
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    // Upload to Cloudinary
-    console.log("Uploading file to Cloudinary...");
-    const cloudinaryResult = await uploadPDFToCloudinary(
-      req.file.buffer,
-      req.file.originalname
-    );
-
-    // Enqueue job with Cloudinary URL instead of local path
-    await queue.add("file-upload-queue", {
-      filename: req.file.originalname,
-      cloudinaryUrl: cloudinaryResult.secure_url,
-      cloudinaryPublicId: cloudinaryResult.public_id,
-      // Keep path for backward compatibility, but it's now a Cloudinary URL
-      path: cloudinaryResult.secure_url,
-    });
-
-    console.log("File uploaded to Cloudinary and queued for processing");
-    return res.json({
-      message: "File uploaded successfully!",
-      cloudinaryUrl: cloudinaryResult.secure_url,
-    });
-  } catch (error) {
-    console.error("Error uploading file:", error);
-    // Handle multer errors (file size, type, etc.)
-    if (error instanceof multer.MulterError) {
-      if (error.code === "LIMIT_FILE_SIZE") {
-        return res
-          .status(400)
-          .json({ error: "File too large. Maximum size is 10MB" });
+// Protected routes - require authentication
+app.post(
+  "/upload/pdf",
+  requireAuth(),
+  upload.single("pdf"),
+  async (req, res) => {
+    try {
+      // Extract userId from Clerk session
+      const userId = req.auth.userId;
+      if (!userId) {
+        return res.status(401).json({ error: "Authentication required" });
       }
-      return res.status(400).json({ error: error.message });
-    }
-    // Handle Cloudinary errors
-    if (error.message?.includes("Cloudinary")) {
-      return res
-        .status(500)
-        .json({ error: "Failed to upload file to cloud storage" });
-    }
-    return res.status(500).json({ error: "Failed to upload file" });
-  }
-});
 
-app.get("/chat", async (req, res) => {
+      // Check upload limit (max 3 PDFs per user)
+      const pdfCount = await getUserPDFCount(userId);
+      if (pdfCount >= 3) {
+        return res.status(400).json({
+          error:
+            "Upload limit reached. Maximum 3 PDFs per user. Please delete a PDF to upload a new one.",
+        });
+      }
+
+      // Validate file was uploaded
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      // Upload to Cloudinary
+      console.log(`Uploading file to Cloudinary for user: ${userId}...`);
+      const cloudinaryResult = await uploadPDFToCloudinary(
+        req.file.buffer,
+        req.file.originalname,
+        userId // Pass userId for folder organization
+      );
+
+      // Create PDF record in Supabase (status: 'pending')
+      const pdfRecord = await createPDFRecord(userId, {
+        filename: req.file.originalname,
+        cloudinaryUrl: cloudinaryResult.secure_url,
+        cloudinaryPublicId: cloudinaryResult.public_id,
+        fileSize: req.file.size,
+      });
+
+      // Enqueue job with Cloudinary URL, userId, and pdfId
+      const jobData = {
+        userId: userId,
+        pdfId: pdfRecord.pdf_id, // Use pdf_id from database record
+        databaseId: pdfRecord.id, // Database UUID for status updates
+        filename: req.file.originalname,
+        cloudinaryUrl: cloudinaryResult.secure_url,
+        cloudinaryPublicId: cloudinaryResult.public_id,
+        // Keep path for backward compatibility, but it's now a Cloudinary URL
+        path: cloudinaryResult.secure_url,
+      };
+
+      console.log(`[UPLOAD] Queuing job with data:`, {
+        userId: jobData.userId,
+        pdfId: jobData.pdfId,
+        databaseId: jobData.databaseId,
+        filename: jobData.filename,
+      });
+
+      await queue.add("file-upload-queue", jobData);
+
+      console.log(
+        `File uploaded to Cloudinary and queued for processing (user: ${userId}, pdfId: ${pdfRecord.pdf_id})`
+      );
+      return res.json({
+        message: "File uploaded successfully!",
+        pdfId: pdfRecord.pdf_id,
+        id: pdfRecord.id,
+        cloudinaryUrl: cloudinaryResult.secure_url,
+      });
+    } catch (error) {
+      console.error("Error uploading file:", error);
+      // Handle multer errors (file size, type, etc.)
+      if (error instanceof multer.MulterError) {
+        if (error.code === "LIMIT_FILE_SIZE") {
+          return res
+            .status(400)
+            .json({ error: "File too large. Maximum size is 10MB" });
+        }
+        return res.status(400).json({ error: error.message });
+      }
+      // Handle Cloudinary errors
+      if (error.message?.includes("Cloudinary")) {
+        return res
+          .status(500)
+          .json({ error: "Failed to upload file to cloud storage" });
+      }
+      return res.status(500).json({ error: "Failed to upload file" });
+    }
+  }
+);
+
+app.get("/chat", requireAuth(), async (req, res) => {
   try {
+    // Extract userId from Clerk session
+    const userId = req.auth.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
     const userQuery = req.query.message;
 
     // Validate query parameter
@@ -250,13 +331,184 @@ app.get("/chat", async (req, res) => {
         .json({ error: "Message query parameter is required" });
     }
 
+    // Parse pdfIds from query (optional - for multi-select)
+    let pdfIds = [];
+    if (req.query.pdfIds) {
+      try {
+        pdfIds = JSON.parse(req.query.pdfIds);
+        if (!Array.isArray(pdfIds)) {
+          pdfIds = [];
+        }
+      } catch (e) {
+        console.warn("Invalid pdfIds format, ignoring:", e);
+        pdfIds = [];
+      }
+    }
+
+    console.log(
+      `[CHAT] userId: ${userId}, query: ${userQuery}, pdfIds from query:`,
+      pdfIds
+    );
+
+    // Validate PDF ownership if pdfIds provided
+    let validPDFIds = [];
+    if (pdfIds.length > 0) {
+      validPDFIds = await validatePDFOwnership(userId, pdfIds);
+      console.log(`[CHAT] Validated pdfIds:`, validPDFIds);
+      if (validPDFIds.length === 0) {
+        return res.status(400).json({
+          error:
+            "No valid PDFs selected. Please select at least one PDF that belongs to you.",
+        });
+      }
+
+      // Check if selected PDFs are processed (status = 'completed')
+      const userPDFs = await getUserPDFs(userId);
+      const selectedPDFs = userPDFs.filter((pdf) =>
+        validPDFIds.includes(pdf.pdf_id)
+      );
+      const unprocessedPDFs = selectedPDFs.filter(
+        (pdf) => pdf.upload_status !== "completed"
+      );
+
+      if (unprocessedPDFs.length > 0) {
+        return res.status(400).json({
+          error:
+            "Some selected PDFs are still processing. Please wait for processing to complete before chatting.",
+        });
+      }
+    } else {
+      // If no pdfIds provided, check if user has any completed PDFs
+      const userPDFs = await getUserPDFs(userId);
+      const completedPDFs = userPDFs.filter(
+        (pdf) => pdf.upload_status === "completed"
+      );
+      if (completedPDFs.length === 0) {
+        return res.status(400).json({
+          error:
+            "No PDFs are ready for chat. Please upload a PDF and wait for processing to complete.",
+        });
+      }
+    }
+
     // Get cached vector store (or create if first request)
     const vectorStore = await getVectorStore();
 
+    // Build Qdrant filter
+    // NOTE: LangChain stores metadata under "metadata" key in Qdrant payload
+    const filter = {
+      must: [
+        {
+          key: "metadata.userId",
+          match: {
+            value: userId,
+          },
+        },
+      ],
+    };
+
+    // Add pdfIds filter if provided and validated
+    if (validPDFIds.length > 0) {
+      // Use 'value' for single pdfId, 'any' for multiple
+      if (validPDFIds.length === 1) {
+        filter.must.push({
+          key: "metadata.pdfId",
+          match: {
+            value: validPDFIds[0],
+          },
+        });
+      } else {
+        filter.must.push({
+          key: "metadata.pdfId",
+          match: {
+            any: validPDFIds,
+          },
+        });
+      }
+    }
+
+    console.log(`[CHAT] Qdrant filter:`, JSON.stringify(filter, null, 2));
+
+    // DEBUG: Test query without filter first to see if any chunks exist
+    try {
+      const debugRetriever = vectorStore.asRetriever({ k: 1 });
+      const debugResult = await debugRetriever.invoke(userQuery);
+      console.log(`[CHAT] DEBUG - Query without filter: ${debugResult?.length || 0} chunks found`);
+      if (debugResult && debugResult.length > 0) {
+        console.log(`[CHAT] DEBUG - Sample metadata (no filter):`, JSON.stringify(debugResult[0]?.metadata || {}, null, 2));
+      }
+    } catch (debugError) {
+      console.error(`[CHAT] DEBUG query error:`, debugError);
+    }
+
     const ret = vectorStore.asRetriever({
-      k: 2,
+      k: 5,
+      filter: filter,
     });
-    const result = await ret.invoke(userQuery);
+    let result = await ret.invoke(userQuery);
+
+    console.log(
+      `[CHAT] Qdrant result count (with pdfId filter):`,
+      result?.length || 0
+    );
+
+    // If no results with pdfId filter, try without pdfId (for legacy PDFs uploaded before pdfId was added)
+    // But still filter by userId for security
+    if ((!result || result.length === 0) && validPDFIds.length > 0) {
+      console.log(
+        `[CHAT] No results with pdfId filter, trying userId-only filter for legacy PDFs`
+      );
+      const legacyFilter = {
+        must: [
+          {
+            key: "metadata.userId",
+            match: {
+              value: userId,
+            },
+          },
+        ],
+      };
+      const legacyRet = vectorStore.asRetriever({
+        k: 5,
+        filter: legacyFilter,
+      });
+      result = await legacyRet.invoke(userQuery);
+      console.log(
+        `[CHAT] Qdrant result count (legacy userId-only filter):`,
+        result?.length || 0
+      );
+    }
+
+    if (result && result.length > 0) {
+      console.log(
+        `[CHAT] First result metadata:`,
+        JSON.stringify(result[0]?.metadata || {}, null, 2)
+      );
+    }
+
+    // Check if we got any results
+    if (!result || result.length === 0) {
+      // If pdfIds were provided but no results, PDFs might not be processed yet
+      if (validPDFIds.length > 0) {
+        return res.status(400).json({
+          error:
+            "No documents found for the selected PDFs. The PDFs might still be processing. Please wait for processing to complete and try again.",
+        });
+      }
+      // If no pdfIds provided, check if user has any PDFs
+      const userPDFs = await getUserPDFs(userId);
+      if (userPDFs.length === 0) {
+        return res.status(400).json({
+          error:
+            "You don't have any PDFs uploaded yet. Please upload a PDF first.",
+        });
+      }
+      // User has PDFs but no results - might be processing or no matching content
+      return res.status(400).json({
+        error:
+          "No matching content found. The PDFs might still be processing, or your question doesn't match the content. Please wait for processing to complete or try a different question.",
+      });
+    }
 
     const SYSTEM_PROMPT = `
 You are a helpful assistant that can answer questions about the documents.
@@ -290,6 +542,143 @@ Context: ${JSON.stringify(result)}
       });
     }
     return res.status(500).json({ error: "Failed to process chat request" });
+  }
+});
+
+// ============================================
+// PDF Management Endpoints
+// ============================================
+
+// Get user's PDFs list
+app.get("/api/pdfs", requireAuth(), async (req, res) => {
+  try {
+    const userId = req.auth.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const pdfs = await getUserPDFs(userId);
+    return res.json(pdfs);
+  } catch (error) {
+    console.error("Error fetching PDFs:", error);
+    return res.status(500).json({ error: "Failed to fetch PDFs" });
+  }
+});
+
+// Get single PDF by ID
+app.get("/api/pdfs/:id", requireAuth(), async (req, res) => {
+  try {
+    const userId = req.auth.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const pdfId = req.params.id;
+    const pdf = await getPDFById(pdfId, userId);
+
+    if (!pdf) {
+      return res.status(404).json({ error: "PDF not found" });
+    }
+
+    return res.json(pdf);
+  } catch (error) {
+    console.error("Error fetching PDF:", error);
+    return res.status(500).json({ error: "Failed to fetch PDF" });
+  }
+});
+
+// Toggle PDF active status (for UI selection)
+app.patch("/api/pdfs/:id/toggle", requireAuth(), async (req, res) => {
+  try {
+    const userId = req.auth.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const pdfId = req.params.id;
+    const { is_active } = req.body;
+
+    if (typeof is_active !== "boolean") {
+      return res.status(400).json({ error: "is_active must be a boolean" });
+    }
+
+    const pdf = await togglePDFActive(pdfId, userId, is_active);
+    return res.json(pdf);
+  } catch (error) {
+    console.error("Error toggling PDF status:", error);
+    if (error.message.includes("not found")) {
+      return res.status(404).json({ error: error.message });
+    }
+    return res.status(500).json({ error: "Failed to toggle PDF status" });
+  }
+});
+
+// Delete PDF (hard delete - removes from Qdrant, Cloudinary, and Supabase)
+app.delete("/api/pdfs/:id", requireAuth(), async (req, res) => {
+  console.log(`[DELETE] Request received:`, {
+    method: req.method,
+    url: req.url,
+    params: req.params,
+    headers: {
+      authorization: req.headers.authorization ? "present" : "missing",
+    },
+  });
+
+  try {
+    const userId = req.auth.userId;
+    console.log(`[DELETE] Extracted userId:`, userId);
+    if (!userId) {
+      console.error(`[DELETE] No userId found in auth`);
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const pdfId = req.params.id;
+    console.log(`[DELETE] pdfId=${pdfId}, userId=${userId}`);
+
+    // Get PDF record to get pdfId and cloudinaryPublicId
+    const pdf = await getPDFById(pdfId, userId);
+    if (!pdf) {
+      console.log(`PDF not found: pdfId=${pdfId}, userId=${userId}`);
+      return res.status(404).json({ error: "PDF not found" });
+    }
+
+    console.log(`Deleting PDF: ${pdf.filename} (pdf_id: ${pdf.pdf_id})`);
+
+    // TODO: Delete from Qdrant (filter: userId + pdfId)
+    // This will be implemented when we have Qdrant deletion helper
+    console.log(
+      `TODO: Delete vectors from Qdrant for pdfId: ${pdf.pdf_id}, userId: ${userId}`
+    );
+
+    // Delete from Cloudinary
+    const { deleteFromCloudinary } = await import("./services/cloudinary.js");
+    try {
+      await deleteFromCloudinary(pdf.cloudinary_public_id, userId);
+      console.log(`Deleted from Cloudinary: ${pdf.cloudinary_public_id}`);
+    } catch (error) {
+      console.warn("Error deleting from Cloudinary (continuing):", error);
+      // Continue even if Cloudinary deletion fails
+    }
+
+    // Delete from Supabase
+    await deletePDFRecord(pdfId, userId);
+    console.log(`Deleted from Supabase: pdfId=${pdfId}`);
+
+    return res.json({
+      message: "PDF deleted successfully",
+      id: pdfId,
+    });
+  } catch (error) {
+    console.error("Error deleting PDF:", error);
+    console.error("Error stack:", error.stack);
+    if (error.message?.includes("not found")) {
+      return res.status(404).json({ error: error.message });
+    }
+    return res.status(500).json({
+      error: "Failed to delete PDF",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 });
 

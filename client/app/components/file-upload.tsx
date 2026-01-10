@@ -1,14 +1,33 @@
 'use client'
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Upload } from "lucide-react"
 import { api } from "@/lib/api"
 
-export default function FileUpload() {
+interface FileUploadProps {
+  onUploadSuccess?: () => void;
+}
+
+export default function FileUpload({ onUploadSuccess }: FileUploadProps) {
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<boolean>(false);
+  const [pdfCount, setPdfCount] = useState<number>(0);
+  const maxPDFs = 3;
+
+  // Load PDF count on mount
+  useEffect(() => {
+    const loadCount = async () => {
+      try {
+        const pdfs = await api.getPDFs();
+        setPdfCount(pdfs.length);
+      } catch (err) {
+        console.error('Error loading PDF count:', err);
+      }
+    };
+    loadCount();
+  }, []);
 
   const handleUploadButtonClick = () => {
     const el = document.createElement('input');
@@ -41,6 +60,8 @@ export default function FileUpload() {
                 console.log("File uploaded successfully:", data);
                 setSuccess(true);
                 setFile(null); // Reset file after successful upload
+                setPdfCount(prev => prev + 1); // Update count
+                onUploadSuccess?.(); // Notify parent to refresh PDF list
                 
                 // Clear success message after 3 seconds
                 setTimeout(() => setSuccess(false), 3000);
@@ -62,9 +83,11 @@ export default function FileUpload() {
     <div className="bg-slate-900 text-white shadow-2xl flex justify-center items-center p-4 rounded-lg border-white border-2 min-h-[200px]">
       <div className="flex flex-col items-center justify-center gap-4 w-full">
       <div 
-          onClick={!uploading ? handleUploadButtonClick : undefined}
-          className={`flex items-center justify-center flex-col cursor-pointer transition-opacity ${
-            uploading ? 'opacity-50 cursor-not-allowed' : 'hover:opacity-80'
+          onClick={!uploading && pdfCount < maxPDFs ? handleUploadButtonClick : undefined}
+          className={`flex items-center justify-center flex-col transition-opacity ${
+            uploading || pdfCount >= maxPDFs 
+              ? 'opacity-50 cursor-not-allowed' 
+              : 'cursor-pointer hover:opacity-80'
           }`}
         >
           <h3 className="mb-2">Upload PDF file</h3>
@@ -94,9 +117,13 @@ export default function FileUpload() {
           </div>
         )}
 
-        <p className="text-xs text-gray-400 mt-2 text-center">
-          Maximum file size: 10MB
-        </p>
+        <div className="text-xs text-gray-400 mt-2 text-center space-y-1">
+          <p>Maximum file size: 10MB</p>
+          <p className={pdfCount >= maxPDFs ? "text-red-400 font-semibold" : ""}>
+            {pdfCount}/{maxPDFs} PDFs uploaded
+            {pdfCount >= maxPDFs && " (Limit reached)"}
+          </p>
+        </div>
       </div>
     </div>
   )
