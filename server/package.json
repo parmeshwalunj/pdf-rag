@@ -10,7 +10,8 @@
     "dev:worker": "node --watch worker.js",
     "start": "node index.js",
     "start:worker": "node worker.js",
-    "start:all": "concurrently \"npm run start\" \"npm run start:worker\""
+    "start:all": "concurrently \"npm run start\" \"npm run start:worker\"",
+    "create-indexes": "node scripts/create-qdrant-indexes.js"
   },
   "keywords": [],
   "author": "",

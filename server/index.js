@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { Queue } from "bullmq";
 import { QdrantVectorStore } from "@langchain/qdrant";
+import { QdrantClient } from "@qdrant/js-client-rest";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { OpenAI } from "openai";
 import { uploadPDFToCloudinary } from "./services/cloudinary.js";
@@ -151,8 +152,69 @@ const getVectorStore = async () => {
   );
 
   console.log("[SERVER] Vector store connection cached");
+  
+  // Ensure indexes exist for filtering (Qdrant Cloud requirement)
+  await ensureQdrantIndexes(qdrantUrl, qdrantApiKey);
+  
   return cachedVectorStore;
 };
+
+/**
+ * Ensure Qdrant payload indexes exist for metadata filtering
+ * Qdrant Cloud requires indexes to be created before filtering on metadata fields
+ */
+async function ensureQdrantIndexes(qdrantUrl, qdrantApiKey) {
+  try {
+    const client = new QdrantClient({
+      url: qdrantUrl,
+      ...(qdrantApiKey && { apiKey: qdrantApiKey }),
+    });
+
+    // Check if collection exists
+    const collections = await client.getCollections();
+    const collectionExists = collections.collections.some(
+      (col) => col.name === "pdf-docs"
+    );
+
+    if (!collectionExists) {
+      console.log("[SERVER] Collection 'pdf-docs' does not exist yet, skipping index creation");
+      return;
+    }
+
+    // Create index for metadata.userId if it doesn't exist
+    try {
+      await client.createPayloadIndex("pdf-docs", {
+        field_name: "metadata.userId",
+        field_schema: "keyword",
+      });
+      console.log("[SERVER] ✅ Created index for metadata.userId");
+    } catch (error) {
+      if (error.data?.status?.error?.includes("already exists")) {
+        // Index already exists, that's fine
+      } else {
+        console.warn("[SERVER] ⚠️  Could not create index for metadata.userId:", error.message);
+      }
+    }
+
+    // Create index for metadata.pdfId if it doesn't exist
+    try {
+      await client.createPayloadIndex("pdf-docs", {
+        field_name: "metadata.pdfId",
+        field_schema: "keyword",
+      });
+      console.log("[SERVER] ✅ Created index for metadata.pdfId");
+    } catch (error) {
+      if (error.data?.status?.error?.includes("already exists")) {
+        // Index already exists, that's fine
+      } else {
+        console.warn("[SERVER] ⚠️  Could not create index for metadata.pdfId:", error.message);
+      }
+    }
+  } catch (error) {
+    console.warn("[SERVER] ⚠️  Could not ensure Qdrant indexes:", error.message);
+    // Don't throw - indexes might already exist or collection might not exist yet
+  }
+}
 
 // File validation: only allow PDFs, max 10MB
 const fileFilter = (req, file, cb) => {
