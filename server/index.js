@@ -36,6 +36,7 @@ const requiredEnvVars = [
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
   "CLERK_SECRET_KEY",
+  "CLERK_PUBLISHABLE_KEY", // Required by @clerk/express middleware
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
 ];

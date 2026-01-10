@@ -22,7 +22,11 @@ interface IMessage {
     documents?: Doc[];
 }
 
-export default function ChatComponent() {
+interface ChatComponentProps {
+  selectedPDFIds?: string[];
+}
+
+export default function ChatComponent({ selectedPDFIds = [] }: ChatComponentProps) {
   const [message, setMessage] = useState<string>("");
   const [messages, setMessages] = useState<IMessage[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
@@ -46,7 +50,8 @@ export default function ChatComponent() {
     setMessages(prev => [...prev, {role: "user", content: userMessage}]);
 
     try {
-      const data = await api.chat(userMessage);
+      // Pass selected PDF IDs to chat API
+      const data = await api.chat(userMessage, selectedPDFIds.length > 0 ? selectedPDFIds : undefined);
       
       // Validate response data
       if (!data || !data.result) {

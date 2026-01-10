@@ -26,6 +26,23 @@ export interface ApiError {
   error: string;
 }
 
+export interface PDF {
+  id: string;
+  user_id: string;
+  pdf_id: string;
+  filename: string;
+  cloudinary_url: string;
+  cloudinary_public_id: string;
+  file_size: number;
+  page_count?: number;
+  chunk_count?: number;
+  upload_status: 'pending' | 'processing' | 'completed' | 'failed';
+  error_message?: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 class ApiClient {
   private baseUrl: string;
   private getToken: (() => Promise<string | null>) | null = null;
@@ -141,6 +158,39 @@ class ApiClient {
     }
     
     return this.request<ChatResponse>(`/chat?${params.toString()}`);
+  }
+
+  /**
+   * Get user's PDFs list
+   */
+  async getPDFs(): Promise<PDF[]> {
+    return this.request<PDF[]>('/api/pdfs');
+  }
+
+  /**
+   * Get single PDF by ID
+   */
+  async getPDF(id: string): Promise<PDF> {
+    return this.request<PDF>(`/api/pdfs/${id}`);
+  }
+
+  /**
+   * Toggle PDF active status
+   */
+  async togglePDF(id: string, isActive: boolean): Promise<PDF> {
+    return this.request<PDF>(`/api/pdfs/${id}/toggle`, {
+      method: 'PATCH',
+      body: JSON.stringify({ is_active: isActive }),
+    });
+  }
+
+  /**
+   * Delete a PDF
+   */
+  async deletePDF(id: string): Promise<{ message: string; id: string }> {
+    return this.request<{ message: string; id: string }>(`/api/pdfs/${id}`, {
+      method: 'DELETE',
+    });
   }
 
   /**
