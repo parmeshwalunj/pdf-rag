@@ -192,12 +192,16 @@ async function ensureQdrantIndexes(qdrantUrl, qdrantApiKey) {
       console.log("[SERVER] ✅ Created index for metadata.userId");
     } catch (error) {
       if (error.data?.status?.error?.includes("already exists")) {
-        // Index already exists, that's fine
+        console.log("[SERVER] ℹ️  Index for metadata.userId already exists");
       } else {
-        console.warn(
-          "[SERVER] ⚠️  Could not create index for metadata.userId:",
+        console.error(
+          "[SERVER] ❌ Could not create index for metadata.userId:",
           error.message
         );
+        if (error.data) {
+          console.error("[SERVER] Error details:", JSON.stringify(error.data, null, 2));
+        }
+        // Don't throw - continue to try pdfId index
       }
     }
 
@@ -210,20 +214,28 @@ async function ensureQdrantIndexes(qdrantUrl, qdrantApiKey) {
       console.log("[SERVER] ✅ Created index for metadata.pdfId");
     } catch (error) {
       if (error.data?.status?.error?.includes("already exists")) {
-        // Index already exists, that's fine
+        console.log("[SERVER] ℹ️  Index for metadata.pdfId already exists");
       } else {
-        console.warn(
-          "[SERVER] ⚠️  Could not create index for metadata.pdfId:",
+        console.error(
+          "[SERVER] ❌ Could not create index for metadata.pdfId:",
           error.message
         );
+        if (error.data) {
+          console.error("[SERVER] Error details:", JSON.stringify(error.data, null, 2));
+        }
+        // Don't throw - log and continue
       }
     }
   } catch (error) {
-    console.warn(
-      "[SERVER] ⚠️  Could not ensure Qdrant indexes:",
+    console.error(
+      "[SERVER] ❌ Could not ensure Qdrant indexes:",
       error.message
     );
-    // Don't throw - indexes might already exist or collection might not exist yet
+    if (error.stack) {
+      console.error("[SERVER] Stack trace:", error.stack);
+    }
+    // Don't throw - we'll try again on next request, but log the error clearly
+    console.error("[SERVER] ⚠️  WARNING: Qdrant indexes may not exist. Chat queries may fail!");
   }
 }
 
@@ -336,7 +348,7 @@ app.post(
         userId: userId,
         pdfId: pdfRecord.pdf_id, // Use pdf_id from database record
         databaseId: pdfRecord.id, // Database UUID for status updates
-        filename: req.file.originalname,
+      filename: req.file.originalname,
         cloudinaryUrl: cloudinaryResult.secure_url,
         cloudinaryPublicId: cloudinaryResult.public_id,
         // Keep path for backward compatibility, but it's now a Cloudinary URL
@@ -525,7 +537,27 @@ app.get("/chat", requireAuth(), async (req, res) => {
       k: 5,
       filter: filter,
     });
-    let result = await ret.invoke(userQuery);
+    
+    let result;
+    try {
+      result = await ret.invoke(userQuery);
+    } catch (queryError) {
+      // If query fails due to missing indexes, try to create them and retry
+      if (queryError.data?.status?.error?.includes("Index required but not found")) {
+        console.log("[CHAT] ⚠️  Index missing, attempting to create indexes...");
+        try {
+          await ensureQdrantIndexes(process.env.QDRANT_URL, process.env.QDRANT_API_KEY);
+          console.log("[CHAT] ✅ Indexes created, retrying query...");
+          // Retry the query
+          result = await ret.invoke(userQuery);
+        } catch (indexError) {
+          console.error("[CHAT] ❌ Failed to create indexes:", indexError.message);
+          throw queryError; // Throw original error
+        }
+      } else {
+        throw queryError; // Re-throw if it's a different error
+      }
+    }
 
     console.log(
       `[CHAT] Qdrant result count (with pdfId filter):`,
@@ -842,4 +874,19 @@ app.use((error, req, res, next) => {
 // Use environment variable for port (required by most cloud platforms)
 // Falls back to 8000 for local development
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`Server started on port: ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server started on port: ${PORT}`);
+  
+  // Try to ensure Qdrant indexes exist on startup
+  // This helps catch index creation issues early
+  if (process.env.QDRANT_URL) {
+    console.log("[SERVER] Ensuring Qdrant indexes exist on startup...");
+    try {
+      await ensureQdrantIndexes(process.env.QDRANT_URL, process.env.QDRANT_API_KEY);
+      console.log("[SERVER] ✅ Qdrant index check completed");
+    } catch (error) {
+      console.error("[SERVER] ⚠️  Qdrant index check failed on startup:", error.message);
+      // Don't crash - indexes will be created on first chat request
+    }
+  }
+});
