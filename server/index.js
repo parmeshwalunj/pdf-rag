@@ -152,10 +152,10 @@ const getVectorStore = async () => {
   );
 
   console.log("[SERVER] Vector store connection cached");
-  
+
   // Ensure indexes exist for filtering (Qdrant Cloud requirement)
   await ensureQdrantIndexes(qdrantUrl, qdrantApiKey);
-  
+
   return cachedVectorStore;
 };
 
@@ -177,7 +177,9 @@ async function ensureQdrantIndexes(qdrantUrl, qdrantApiKey) {
     );
 
     if (!collectionExists) {
-      console.log("[SERVER] Collection 'pdf-docs' does not exist yet, skipping index creation");
+      console.log(
+        "[SERVER] Collection 'pdf-docs' does not exist yet, skipping index creation"
+      );
       return;
     }
 
@@ -190,9 +192,16 @@ async function ensureQdrantIndexes(qdrantUrl, qdrantApiKey) {
       console.log("[SERVER] ✅ Created index for metadata.userId");
     } catch (error) {
       if (error.data?.status?.error?.includes("already exists")) {
-        // Index already exists, that's fine
+        console.log("[SERVER] ℹ️  Index for metadata.userId already exists");
       } else {
-        console.warn("[SERVER] ⚠️  Could not create index for metadata.userId:", error.message);
+        console.error(
+          "[SERVER] ❌ Could not create index for metadata.userId:",
+          error.message
+        );
+        if (error.data) {
+          console.error("[SERVER] Error details:", JSON.stringify(error.data, null, 2));
+        }
+        // Don't throw - continue to try pdfId index
       }
     }
 
@@ -205,14 +214,28 @@ async function ensureQdrantIndexes(qdrantUrl, qdrantApiKey) {
       console.log("[SERVER] ✅ Created index for metadata.pdfId");
     } catch (error) {
       if (error.data?.status?.error?.includes("already exists")) {
-        // Index already exists, that's fine
+        console.log("[SERVER] ℹ️  Index for metadata.pdfId already exists");
       } else {
-        console.warn("[SERVER] ⚠️  Could not create index for metadata.pdfId:", error.message);
+        console.error(
+          "[SERVER] ❌ Could not create index for metadata.pdfId:",
+          error.message
+        );
+        if (error.data) {
+          console.error("[SERVER] Error details:", JSON.stringify(error.data, null, 2));
+        }
+        // Don't throw - log and continue
       }
     }
   } catch (error) {
-    console.warn("[SERVER] ⚠️  Could not ensure Qdrant indexes:", error.message);
-    // Don't throw - indexes might already exist or collection might not exist yet
+    console.error(
+      "[SERVER] ❌ Could not ensure Qdrant indexes:",
+      error.message
+    );
+    if (error.stack) {
+      console.error("[SERVER] Stack trace:", error.stack);
+    }
+    // Don't throw - we'll try again on next request, but log the error clearly
+    console.error("[SERVER] ⚠️  WARNING: Qdrant indexes may not exist. Chat queries may fail!");
   }
 }
 
@@ -325,7 +348,7 @@ app.post(
         userId: userId,
         pdfId: pdfRecord.pdf_id, // Use pdf_id from database record
         databaseId: pdfRecord.id, // Database UUID for status updates
-        filename: req.file.originalname,
+      filename: req.file.originalname,
         cloudinaryUrl: cloudinaryResult.secure_url,
         cloudinaryPublicId: cloudinaryResult.public_id,
         // Keep path for backward compatibility, but it's now a Cloudinary URL
@@ -495,9 +518,16 @@ app.get("/chat", requireAuth(), async (req, res) => {
     try {
       const debugRetriever = vectorStore.asRetriever({ k: 1 });
       const debugResult = await debugRetriever.invoke(userQuery);
-      console.log(`[CHAT] DEBUG - Query without filter: ${debugResult?.length || 0} chunks found`);
+      console.log(
+        `[CHAT] DEBUG - Query without filter: ${
+          debugResult?.length || 0
+        } chunks found`
+      );
       if (debugResult && debugResult.length > 0) {
-        console.log(`[CHAT] DEBUG - Sample metadata (no filter):`, JSON.stringify(debugResult[0]?.metadata || {}, null, 2));
+        console.log(
+          `[CHAT] DEBUG - Sample metadata (no filter):`,
+          JSON.stringify(debugResult[0]?.metadata || {}, null, 2)
+        );
       }
     } catch (debugError) {
       console.error(`[CHAT] DEBUG query error:`, debugError);
@@ -507,7 +537,27 @@ app.get("/chat", requireAuth(), async (req, res) => {
       k: 5,
       filter: filter,
     });
-    let result = await ret.invoke(userQuery);
+    
+    let result;
+    try {
+      result = await ret.invoke(userQuery);
+    } catch (queryError) {
+      // If query fails due to missing indexes, try to create them and retry
+      if (queryError.data?.status?.error?.includes("Index required but not found")) {
+        console.log("[CHAT] ⚠️  Index missing, attempting to create indexes...");
+        try {
+          await ensureQdrantIndexes(process.env.QDRANT_URL, process.env.QDRANT_API_KEY);
+          console.log("[CHAT] ✅ Indexes created, retrying query...");
+          // Retry the query
+          result = await ret.invoke(userQuery);
+        } catch (indexError) {
+          console.error("[CHAT] ❌ Failed to create indexes:", indexError.message);
+          throw queryError; // Throw original error
+        }
+      } else {
+        throw queryError; // Re-throw if it's a different error
+      }
+    }
 
     console.log(
       `[CHAT] Qdrant result count (with pdfId filter):`,
@@ -706,11 +756,71 @@ app.delete("/api/pdfs/:id", requireAuth(), async (req, res) => {
 
     console.log(`Deleting PDF: ${pdf.filename} (pdf_id: ${pdf.pdf_id})`);
 
-    // TODO: Delete from Qdrant (filter: userId + pdfId)
-    // This will be implemented when we have Qdrant deletion helper
-    console.log(
-      `TODO: Delete vectors from Qdrant for pdfId: ${pdf.pdf_id}, userId: ${userId}`
-    );
+    // Delete from Qdrant (filter: userId + pdfId)
+    try {
+      const qdrantUrl = process.env.QDRANT_URL;
+      const qdrantApiKey = process.env.QDRANT_API_KEY;
+
+      if (qdrantUrl) {
+        const qdrantClient = new QdrantClient({
+          url: qdrantUrl,
+          ...(qdrantApiKey && { apiKey: qdrantApiKey }),
+        });
+
+        // Delete all points matching userId and pdfId
+        const deleteFilter = {
+          must: [
+            {
+              key: "metadata.userId",
+              match: {
+                value: userId,
+              },
+            },
+            {
+              key: "metadata.pdfId",
+              match: {
+                value: pdf.pdf_id,
+              },
+            },
+          ],
+        };
+
+        // Scroll to get all point IDs matching the filter
+        const scrollResult = await qdrantClient.scroll("pdf-docs", {
+          filter: deleteFilter,
+          limit: 10000, // Large limit to get all points
+          with_payload: false,
+          with_vector: false,
+        });
+
+        if (scrollResult.points && scrollResult.points.length > 0) {
+          const pointIds = scrollResult.points.map((point) => point.id);
+          console.log(
+            `[DELETE] Found ${pointIds.length} vectors to delete from Qdrant`
+          );
+
+          // Delete the points
+          await qdrantClient.delete("pdf-docs", {
+            wait: true,
+            points: pointIds,
+          });
+
+          console.log(
+            `[DELETE] Deleted ${pointIds.length} vectors from Qdrant`
+          );
+        } else {
+          console.log(
+            `[DELETE] No vectors found in Qdrant for pdfId: ${pdf.pdf_id}`
+          );
+        }
+      }
+    } catch (error) {
+      console.warn(
+        "[DELETE] Error deleting from Qdrant (continuing):",
+        error.message
+      );
+      // Continue even if Qdrant deletion fails - we still want to delete from other services
+    }
 
     // Delete from Cloudinary
     const { deleteFromCloudinary } = await import("./services/cloudinary.js");
@@ -764,4 +874,19 @@ app.use((error, req, res, next) => {
 // Use environment variable for port (required by most cloud platforms)
 // Falls back to 8000 for local development
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`Server started on port: ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server started on port: ${PORT}`);
+  
+  // Try to ensure Qdrant indexes exist on startup
+  // This helps catch index creation issues early
+  if (process.env.QDRANT_URL) {
+    console.log("[SERVER] Ensuring Qdrant indexes exist on startup...");
+    try {
+      await ensureQdrantIndexes(process.env.QDRANT_URL, process.env.QDRANT_API_KEY);
+      console.log("[SERVER] ✅ Qdrant index check completed");
+    } catch (error) {
+      console.error("[SERVER] ⚠️  Qdrant index check failed on startup:", error.message);
+      // Don't crash - indexes will be created on first chat request
+    }
+  }
+});
